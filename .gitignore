@@ -1,0 +1,36 @@
+# ============================================
+# STM32L151RE 火源识别模块 — .gitignore
+# 只提交自定义代码相关文件，忽略 HAL 库和编译产物
+# ============================================
+
+# === HAL 库驱动（可从 .ioc 重新生成）===
+Drivers/
+
+# === Keil 设备包 & CMSIS 模板（可重新下载/生成）===
+.pack/
+.cmsis/
+
+# === Keil MDK-ARM 编译产物 ===
+MDK-ARM/fire_source_identification/
+
+# === Keil 用户设置 ===
+*.uvguix.*
+
+# === 调试配置（可重新生成）===
+DebugConfig/
+
+# === IDE / 编辑器配置 ===
+.vscode/
+.settings/
+.mxproject
+
+# === EIDE 日志（保留 .eide/*.yml 等项目配置）===
+.eide/log
+.eide.usr.ctx.json
+
+# === GCC Makefile 构建输出 ===
+build/
+
+# === EIDE 模板 ===
+*.ept
+*.eide-template

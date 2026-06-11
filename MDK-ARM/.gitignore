@@ -1,0 +1,5 @@
+# MDK-ARM 编译产物
+fire_source_identification/
+
+# 用户 GUI 设置
+*.uvguix.*
