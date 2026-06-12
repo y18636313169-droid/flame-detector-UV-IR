@@ -109,13 +109,11 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   BSP_BoardInit();
-  BSP_TIM_IC_Start(BSP_TIM_UV);    // 启动 TIM3 脉冲捕获
   AP_ADC_Init();
   AP_UART_ProtocolInit();
 
   AP_UV_Init(5, NULL);    // 初始化紫外灵敏度和注册fire发生时的回调函数
   /* USER CODE END 2 */
-
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -124,15 +122,15 @@ int main(void)
     AP_UART_TxTask(); // 串口通信TX任务
     AP_UART_RxTask(); // 串口通信RX任务
     
-    AP_UV_Feed();
-    AP_UV_Process(HAL_GetTick());
+    AP_UV_Process(HAL_GetTick()); // 获取紫外脉冲+判断
 
     if (AP_ADC_IsPrintPending()) {
-        AP_ADC_PrintDebug();      // 主循环上下文，阻塞安全
+        AP_ADC_PrintDebug();      // 主循环打印，阻塞安全
     }
 
     BSP_IWDG_CheckAndRefresh();   // 检查标志位并喂狗
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

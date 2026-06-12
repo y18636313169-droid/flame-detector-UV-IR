@@ -1,11 +1,11 @@
 /**
   ******************************************************************************
   * @file    hal_adc.c
-  * @brief   BSP ADC 抽象层实现 — 单通道 DMA 连续转换
+  * @brief   BSP ADC 抽象层实现 — 3 通道 DMA 连续转换
   *
   *          CubeMX 配置：
-  *            - ADC1, 扫描模式(1通道 IN11/PC1), 连续转换
-  *            - DMA1_CH1, CIRCULAR, 半字传输
+  *            - ADC1, 三通道扫描(IN10/PC0, IN11/PC1, IN12/PC2), 连续转换
+  *            - DMA1_CH1, CIRCULAR, 半字传输, 内存递增
   ******************************************************************************
   */
 
@@ -14,7 +14,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-static uint16_t adc_dma_buf[1];
+static uint16_t adc_dma_buf[BSP_ADC_NUM_CHANNELS];                 /* 3 通道 DMA 缓冲 */
 static uint8_t  adc_dma_running = 0;
 static uint8_t  adc_initialized = 0;
 
@@ -31,7 +31,7 @@ int BSP_ADC_Init(void)
 int BSP_ADC_StartDMA(void)
 {
     if (!adc_initialized) return BSP_ADC_ERROR;
-    if (HAL_ADC_Start_DMA(&hadc, (uint32_t *)adc_dma_buf, 1) != HAL_OK) {
+    if (HAL_ADC_Start_DMA(&hadc, (uint32_t *)adc_dma_buf, BSP_ADC_NUM_CHANNELS) != HAL_OK) {
         return BSP_ADC_ERROR;
     }
     adc_dma_running = 1;
@@ -45,9 +45,10 @@ void BSP_ADC_StopDMA(void)
     adc_dma_running = 0;
 }
 
-int BSP_ADC_ReadValue(uint16_t *raw)
+int BSP_ADC_ReadValue(uint32_t ch, uint16_t *raw)
 {
     if (!adc_dma_running || raw == NULL) return -1;
-    *raw = adc_dma_buf[0];
+    if (ch >= BSP_ADC_NUM_CHANNELS) return -1;
+    *raw = adc_dma_buf[ch];
     return 0;
 }

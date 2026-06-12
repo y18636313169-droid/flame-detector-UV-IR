@@ -1,10 +1,10 @@
 /**
   ******************************************************************************
   * @file    ap_adc.h
-  * @brief   AP 层 ADC 采样管理 — 滑动滤波
+  * @brief   AP 层 ADC 采样管理 — 3 通道独立滑动滤波
   *
-  *          基于 BSP 层 DMA 连续转换，周期性读取最新 ADC 原始值，
-  *          做滑动窗口平均滤波，通过 DBG 串口输出调试信息。
+  *          基于 BSP 层 3 通道 DMA 连续转换，周期性读取各通道 ADC 原始值，
+  *          分别做滑动窗口平均滤波，通过 DBG 串口输出调试信息。
   ******************************************************************************
   */
 #ifndef __AP_ADC_H__
@@ -22,8 +22,8 @@ extern "C" {
 
 void     AP_ADC_Init(void);
 void     AP_ADC_Update(void);
-uint16_t AP_ADC_GetFiltered(void);
-uint16_t AP_ADC_GetLatest(void);
+uint16_t AP_ADC_GetFiltered(uint32_t ch);
+uint16_t AP_ADC_GetLatest(uint32_t ch);
 
 /** @brief  检查是否需要打印调试信息（由 Update 在 ISR 中置位）
   * @retval 1: 主循环应调用 AP_ADC_PrintDebug()

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"e:/work/fire_source_identification/soc/fire_source_identification/\")",
+      "Read(//e/work/fire_source_identification/soc/fire_source_identification/**)"
+    ]
+  }
+}
