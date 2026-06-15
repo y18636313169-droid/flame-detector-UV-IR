@@ -18,6 +18,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "ap_uart_protocol.h"
 #include "hal_uart.h"
+#include "crc16.h"
 #include <string.h>
 
 /* ========================================================================== */
@@ -70,7 +71,6 @@ static uint16_t rx_frame_len;
 /*                         内部函数声明                                        */
 /* ========================================================================== */
 
-static uint16_t crc16_modbus(const uint8_t *data, uint16_t len);
 static int      tx_buf_push(uint8_t fcode, const uint8_t *data, uint16_t data_len);
 static int      tx_buf_check(void);                    /* 仅检查缓冲非空+长度合法 */
 static int      tx_buf_pop(uint8_t *fcode, uint8_t *data, uint16_t *data_len);
@@ -80,24 +80,9 @@ static void     tx_complete(void);
 static void     process_rx_frame(void);
 
 /* ========================================================================== */
-/*                          CRC16 Modbus                                      */
+/*                          CRC16 Modbus                                       */
+/*          使用 modules/crc/crc16.h 中的共享 CRC16_Modbus                     */
 /* ========================================================================== */
-
-static uint16_t crc16_modbus(const uint8_t *data, uint16_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x01) {
-                crc = (crc >> 1) ^ 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return crc;
-}
 
 /* ========================================================================== */
 /*                     TX 事件缓冲管理                                         */
@@ -228,7 +213,7 @@ static void tx_send_pending(void)
         memcpy(&frame[pos], tx_pending.data, tx_pending.data_len);
         pos += tx_pending.data_len;
     }
-    uint16_t crc = crc16_modbus(&frame[AP_UART_OFFSET_LEN], frame_len - 1);
+    uint16_t crc = CRC16_Modbus(&frame[AP_UART_OFFSET_LEN], frame_len - 1);
     frame[pos++] = (uint8_t)(crc >> 8);
     frame[pos++] = (uint8_t)(crc);
     frame[pos++] = AP_UART_ETX;
@@ -400,7 +385,7 @@ void AP_UART_RxTask(void)
             BSP_UART_PeekPacket(BSP_UART_COM, rx_frame, 0, total);
 
             /* CRC 范围：从 LEN 起，LEN+FCODE+DATA = 共 len-1 字节 */
-            uint16_t crc_calc = crc16_modbus(&rx_frame[AP_UART_OFFSET_LEN],
+            uint16_t crc_calc = CRC16_Modbus(&rx_frame[AP_UART_OFFSET_LEN],
                                               rx_frame_len - 1);
             uint16_t crc_recv = (uint16_t)rx_frame[CRC_OFFSET_HI(rx_frame_len)] << 8
                               | (uint16_t)rx_frame[CRC_OFFSET_LO(rx_frame_len)];
@@ -458,7 +443,7 @@ static void send_ack_frame(uint8_t peer_seq, uint8_t fcode,
         memcpy(&frame[pos], ack_data, ack_len);
         pos += ack_len;
     }
-    uint16_t crc = crc16_modbus(&frame[AP_UART_OFFSET_LEN], frame_len - 1);
+    uint16_t crc = CRC16_Modbus(&frame[AP_UART_OFFSET_LEN], frame_len - 1);
     frame[pos++] = (uint8_t)(crc >> 8);
     frame[pos++] = (uint8_t)(crc);
     frame[pos++] = AP_UART_ETX;

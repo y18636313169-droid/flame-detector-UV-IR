@@ -337,7 +337,7 @@
               <MiscControls />
               <Define>USE_HAL_DRIVER,STM32L151xE</Define>
               <Undefine />
-              <IncludePath>../Core/Inc;../Drivers/STM32L1xx_HAL_Driver/Inc;../Drivers/STM32L1xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L1xx/Include;../Drivers/CMSIS/Include;../Code/bsp/inc;../Code/ap/inc</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32L1xx_HAL_Driver/Inc;../Drivers/STM32L1xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L1xx/Include;../Drivers/CMSIS/Include;../Code/bsp/inc;../Code/ap/inc;../Code/modules/cmdline;../Code/modules/crc</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -581,6 +581,11 @@
               <FileType>1</FileType>
               <FilePath>..\Code\bsp\src\ring_buffer.c</FilePath>
             </File>
+            <File>
+              <FileName>hal_eeprom.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Code\bsp\src\hal_eeprom.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -601,10 +606,32 @@
               <FileType>1</FileType>
               <FilePath>..\Code\ap\src\ap_uv.c</FilePath>
             </File>
+            <File>
+              <FileName>ap_eeprom.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Code\ap\src\ap_eeprom.c</FilePath>
+            </File>
+            <File>
+              <FileName>ap_ir.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Code\ap\src\ap_ir.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
           <GroupName>Core/modules</GroupName>
+          <Files>
+            <File>
+              <FileName>cmd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Code\modules\cmdline\cmd.c</FilePath>
+            </File>
+            <File>
+              <FileName>crc16.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Code\modules\crc\crc16.c</FilePath>
+            </File>
+          </Files>
         </Group>
         <Group>
           <GroupName>::CMSIS</GroupName>

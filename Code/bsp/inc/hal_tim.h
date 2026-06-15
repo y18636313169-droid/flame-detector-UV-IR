@@ -103,6 +103,15 @@ int  BSP_TIM_IC_Stop(BSP_TIM_Id_t id);
 int  BSP_TIM_IC_ReadPulse(BSP_TIM_Id_t id, BSP_TIM_PulseData_t *pulse);
 
 /**
+  * @brief  清空 TIM 脉冲环形缓冲区（丢弃所有未读脉冲）
+  *         用于状态复位时防止旧脉冲数据影响新判定周期。
+  * @param  id: TIM 端口 ID
+  * @retval 0: 成功
+  * @retval -1: 无效 ID 或未初始化
+  */
+int  BSP_TIM_IC_ClearAllPulse(BSP_TIM_Id_t id);
+
+/**
   * @brief  批量读取所有脉冲数据（非阻塞）
   * @param  id:       TIM 端口 ID
   * @param  pulses:   输出数组
@@ -110,6 +119,7 @@ int  BSP_TIM_IC_ReadPulse(BSP_TIM_Id_t id, BSP_TIM_PulseData_t *pulse);
   * @retval 实际读取到的脉冲数量（0 = 缓冲空）
   */
 uint16_t BSP_TIM_IC_ReadAllPulse(BSP_TIM_Id_t id, BSP_TIM_PulseData_t *pulses, uint16_t max);
+
 
 /* ========================================================================== */
 /*     内部转发接口 — 由 main.c 中的 HAL 弱回调调用                            */

@@ -13,6 +13,7 @@
   */
 
 #include "ap_uv.h"
+#include "ap_eeprom.h"
 #include "hal_tim.h"
 #include "hal_uart.h"
 #include <string.h>
@@ -44,11 +45,17 @@ typedef struct {
     uint8_t     head;
     uint8_t     count;
 
-    uint8_t     level;
-    uint32_t    window_ms;
+    uint8_t     level;              /* 当前等级 0~9 */
+    uint32_t    window_ms;          /* 当前实际检测参数 */
     uint8_t     threshold;
     uint32_t    confirm_ms;
     uint32_t    clear_ms;
+
+    /* min/max 配置（用于等级→参数插值）*/
+    uint32_t    thr_min, thr_max;
+    uint32_t    win_min, win_max;
+    uint32_t    cfm_min, cfm_max;
+    uint32_t    clr_min, clr_max;
 
     UV_DetectorState_t state;
     uint32_t    warning_start_ms;
@@ -58,28 +65,6 @@ typedef struct {
 } UV_FlameDetector_t;
 
 static UV_FlameDetector_t uv_det;
-
-/* ========================================================================== */
-/*                        内部辅助 — 参数计算                                 */
-/* ========================================================================== */
-
-static void uv_calc_params(void)
-{
-    uint8_t lv = uv_det.level;
-    if (lv >= UV_SENS_LEVELS) lv = UV_SENS_LEVELS - 1;
-
-    uv_det.window_ms  = UV_WINDOW_MS_0
-                      - (UV_WINDOW_MS_0 - UV_WINDOW_MS_9) * lv / (UV_SENS_LEVELS - 1);
-
-    uv_det.threshold  = UV_THRESHOLD_0
-                      - (UV_THRESHOLD_0 - UV_THRESHOLD_9) * lv / (UV_SENS_LEVELS - 1);
-
-    uv_det.confirm_ms = UV_CONFIRM_MS_0
-                      - (UV_CONFIRM_MS_0 - UV_CONFIRM_MS_9) * lv / (UV_SENS_LEVELS - 1);
-
-    uv_det.clear_ms   = UV_CLEAR_MS_0
-                      - (UV_CLEAR_MS_0 - UV_CLEAR_MS_9) * lv / (UV_SENS_LEVELS - 1);
-}
 
 /* ========================================================================== */
 /*                        内部辅助 — 状态名                                    */
@@ -99,15 +84,21 @@ static const char *uv_state_name(UV_DetectorState_t s)
 /*                        公有 API 实现                                        */
 /* ========================================================================== */
 
-void AP_UV_Init(uint8_t level, void (*on_fire)(void))
+void AP_UV_Init(void (*on_fire)(void))
 {
     memset(&uv_det, 0, sizeof(uv_det));
 
-    uv_det.level   = (level >= UV_SENS_LEVELS) ? (UV_SENS_LEVELS - 1) : level;
     uv_det.state   = UV_STATE_IDLE;
     uv_det.on_fire = on_fire;
 
-    uv_calc_params();
+    /* 从 EEPROM 加载参数并自动计算 */
+    const AP_EEPROM_UV_Param_t *p = AP_EEPROM_UV_Get();
+    uv_det.level = (p->sensitivity < UV_SENS_LEVELS) ? p->sensitivity : (UV_SENS_LEVELS - 1);
+    AP_UV_SetConfig(p->thr_min, p->thr_max,
+                     p->win_min, p->win_max,
+                     p->cfm_min, p->cfm_max,
+                     p->clr_min, p->clr_max);
+    AP_UV_SetLevel(uv_det.level);
 }
 
 void AP_UV_Feed(void)
@@ -195,22 +186,92 @@ void AP_UV_Process(uint32_t now)
     }
 }
 
+/* ========================================================================== */
+/*                        内部辅助 — 线性插值                                  */
+/* ========================================================================== */
+
+static uint32_t lerp(uint32_t min, uint32_t max, uint32_t level)
+{
+    if (level >= UV_SENS_LEVELS) level = UV_SENS_LEVELS - 1;
+    return min + ((max - min) * level) / (UV_SENS_LEVELS - 1);
+}
+
+/* ========================================================================== */
+
+void AP_UV_SetConfig(uint32_t thr_min, uint32_t thr_max,
+                     uint32_t win_min, uint32_t win_max,
+                     uint32_t cfm_min, uint32_t cfm_max,
+                     uint32_t clr_min, uint32_t clr_max)
+{
+    uv_det.thr_min = thr_min;
+    uv_det.thr_max = thr_max;
+    uv_det.win_min = win_min;
+    uv_det.win_max = win_max;
+    uv_det.cfm_min = cfm_min;
+    uv_det.cfm_max = cfm_max;
+    uv_det.clr_min = clr_min;
+    uv_det.clr_max = clr_max;
+}
+
+void AP_UV_GetConfig(uint32_t *thr_min, uint32_t *thr_max,
+                     uint32_t *win_min, uint32_t *win_max,
+                     uint32_t *cfm_min, uint32_t *cfm_max,
+                     uint32_t *clr_min, uint32_t *clr_max)
+{
+    if (thr_min) *thr_min = uv_det.thr_min;
+    if (thr_max) *thr_max = uv_det.thr_max;
+    if (win_min) *win_min = uv_det.win_min;
+    if (win_max) *win_max = uv_det.win_max;
+    if (cfm_min) *cfm_min = uv_det.cfm_min;
+    if (cfm_max) *cfm_max = uv_det.cfm_max;
+    if (clr_min) *clr_min = uv_det.clr_min;
+    if (clr_max) *clr_max = uv_det.clr_max;
+}
+
 void AP_UV_SetLevel(uint8_t level)
 {
     uv_det.level = (level >= UV_SENS_LEVELS) ? (UV_SENS_LEVELS - 1) : level;
-    uv_calc_params();
-    DBG("SetLevel %u: win=%ums thr=%u confirm=%ums clear=%ums",
-        uv_det.level, uv_det.window_ms, uv_det.threshold,
+    uint32_t lv = uv_det.level;
+
+    uv_det.threshold  = (uint8_t)lerp(uv_det.thr_min, uv_det.thr_max, lv);
+    uv_det.window_ms  = lerp(uv_det.win_min, uv_det.win_max, lv);
+    uv_det.confirm_ms = lerp(uv_det.cfm_min, uv_det.cfm_max, lv);
+    uv_det.clear_ms   = lerp(uv_det.clr_min, uv_det.clr_max, lv);
+
+    DBG("SetLevel %u: thr=%u win=%lu cfm=%lu clr=%lu",
+        uv_det.level, uv_det.threshold, uv_det.window_ms,
         uv_det.confirm_ms, uv_det.clear_ms);
 }
 
-void AP_UV_Reset(void)
+// void AP_UV_SetParams(uint32_t threshold, uint32_t window_ms,
+//                      uint32_t confirm_ms, uint32_t clear_ms)
+// {
+//     uv_det.threshold  = (uint8_t)threshold;
+//     uv_det.window_ms  = window_ms;
+//     uv_det.confirm_ms = confirm_ms;
+//     uv_det.clear_ms   = clear_ms;
+// }
+
+void AP_UV_Process_Reset(void)
 {
     uv_det.state = UV_STATE_IDLE;
     uv_det.warning_start_ms = 0;
+    uv_det.fire_start_ms = 0;
+
+    /* 清空 TIM3 脉冲环缓冲，防止旧脉冲影响新判定 */
+    BSP_TIM_IC_ClearAllPulse(BSP_TIM_UV);
 }
 
 UV_DetectorState_t AP_UV_GetState(void)
 {
     return uv_det.state;
+}
+
+void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
+                     uint32_t *confirm_ms, uint32_t *clear_ms)
+{
+    if (threshold)  *threshold  = uv_det.threshold;
+    if (window_ms)  *window_ms  = uv_det.window_ms;
+    if (confirm_ms) *confirm_ms = uv_det.confirm_ms;
+    if (clear_ms)   *clear_ms   = uv_det.clear_ms;
 }

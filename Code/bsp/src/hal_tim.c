@@ -236,6 +236,17 @@ uint16_t BSP_TIM_IC_ReadAllPulse(BSP_TIM_Id_t id, BSP_TIM_PulseData_t *pulses, u
     return cnt;
 }
 
+int BSP_TIM_IC_ClearAllPulse(BSP_TIM_Id_t id)
+{
+    if (!is_valid_id(id) || !tim_ctrl[id].initialized)
+    {
+        return -1;
+    }
+
+    ring_buffer_clear(&tim_ctrl[id].pulse_rb);
+    return 0;
+}
+
 /* ========================================================================== */
 /*         旧单通道极性翻转捕获实现 — 保留注释以供后续参考                     */
 /* ========================================================================== */

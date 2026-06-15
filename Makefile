@@ -65,7 +65,26 @@ Drivers/STM32L1xx_HAL_Driver/Src/stm32l1xx_hal_tim_ex.c \
 Drivers/STM32L1xx_HAL_Driver/Src/stm32l1xx_hal_uart.c \
 Core/Src/system_stm32l1xx.c \
 Core/Src/sysmem.c \
-Core/Src/syscalls.c  
+Core/Src/syscalls.c  \
+Code/bsp/src/hal_adc.c \
+Code/bsp/src/hal_board.c \
+Code/bsp/src/hal_gpio.c \
+Code/bsp/src/hal_iwdg.c \
+Code/bsp/src/hal_led.c \
+Code/bsp/src/hal_tim.c \
+Code/bsp/src/hal_uart.c \
+Code/bsp/src/hal_eeprom.c \
+Code/bsp/src/ring_buffer.c \
+Code/ap/src/ap_adc.c \
+Code/ap/src/ap_eeprom.c \
+Code/ap/src/ap_ir.c \
+Code/ap/src/ap_uart_protocol.c \
+Code/ap/src/ap_uv.c \
+Code/ap/src/app_uart_api.c \
+Code/ap/src/app_uart_api_evt.c \
+Code/ap/src/app_uart_api_sub.c \
+Code/modules/cmdline/cmd.c \
+Code/modules/crc/crc16.c
 
 # ASM sources
 ASM_SOURCES =  \
@@ -130,7 +149,11 @@ C_INCLUDES =  \
 -IDrivers/STM32L1xx_HAL_Driver/Inc \
 -IDrivers/STM32L1xx_HAL_Driver/Inc/Legacy \
 -IDrivers/CMSIS/Device/ST/STM32L1xx/Include \
--IDrivers/CMSIS/Include
+-IDrivers/CMSIS/Include \
+-ICode/bsp/inc \
+-ICode/ap/inc \
+-ICode/modules/cmdline \
+-ICode/modules/crc
 
 
 # compile gcc flags

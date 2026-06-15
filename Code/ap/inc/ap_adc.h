@@ -18,7 +18,7 @@ extern "C" {
 #include <stdint.h>
 
 #define AP_ADC_WIN_SIZE          (5U)
-#define AP_ADC_PRINT_INTERVAL    (10U)
+#define AP_ADC_PRINT_INTERVAL    (50U)
 
 void     AP_ADC_Init(void);
 void     AP_ADC_Update(void);

@@ -71,15 +71,20 @@ virtualFolder:
             - path: Code/bsp/src/hal_uart.c
             - path: Code/bsp/src/ring_buffer.c
             - path: Code/bsp/src/hal_iwdg.c
+            - path: Code/bsp/src/hal_eeprom.c
           folders: []
         - name: ap
           files:
             - path: Code/ap/src/ap_adc.c
             - path: Code/ap/src/ap_uart_protocol.c
             - path: Code/ap/src/ap_uv.c
+            - path: Code/ap/src/ap_eeprom.c
+            - path: Code/ap/src/ap_ir.c
           folders: []
         - name: modules
-          files: []
+          files:
+            - path: Code/modules/cmdline/cmd.c
+            - path: Code/modules/crc/crc16.c
           folders: []
     - name: ::CMSIS
       files: []
@@ -103,6 +108,8 @@ targets:
         - Drivers/CMSIS/Include
         - Code/bsp/inc
         - Code/ap/inc
+        - Code/modules/cmdline
+        - Code/modules/crc
         - .cmsis/include
         - MDK-ARM/RTE/_fire_source_identification
       libList: []

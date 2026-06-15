@@ -176,7 +176,7 @@ STEP_DATA: PeekPacket 整帧 → CRC 校验 → ETX 检查 → Consume → proce
 | `AP_UV_Feed()` | 从 BSP 读取脉冲加入历史队列 |
 | `AP_UV_Process(now)` | 内部调 Feed → 窗口计数 → 状态机 |
 | `AP_UV_SetLevel(level)` | 运行时调整灵敏度 0~9 |
-| `AP_UV_Reset()` | 重置状态机到 IDLE |
+| `AP_UV_Process_Reset()` | 重置状态机到 IDLE |
 | `AP_UV_GetState()` | 返回当前状态 |
 
 #### 紫外状态机

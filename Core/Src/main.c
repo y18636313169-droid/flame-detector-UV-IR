@@ -34,8 +34,10 @@
 #include "hal_iwdg.h"
 
 #include "ap_adc.h"
+#include "ap_eeprom.h"
 #include "ap_uart_protocol.h"
 #include "ap_uv.h"
+#include "cmd.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -109,10 +111,11 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   BSP_BoardInit();
+
+  AP_EEPROM_Init();    // 加载 EEPROM 参数到内存
+  AP_UV_Init(NULL);    // 从 EEPROM 读取参数并初始化紫外检测
   AP_ADC_Init();
   AP_UART_ProtocolInit();
-
-  AP_UV_Init(5, NULL);    // 初始化紫外灵敏度和注册fire发生时的回调函数
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -121,7 +124,9 @@ int main(void)
   {
     AP_UART_TxTask(); // 串口通信TX任务
     AP_UART_RxTask(); // 串口通信RX任务
-    
+
+    cmd_parser_task(); // 命令行解析
+
     AP_UV_Process(HAL_GetTick()); // 获取紫外脉冲+判断
 
     if (AP_ADC_IsPrintPending()) {

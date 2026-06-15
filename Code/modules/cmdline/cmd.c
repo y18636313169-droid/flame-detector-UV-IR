@@ -1,0 +1,484 @@
+#include "cmd.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include "hal_uart.h"
+#include "ap_eeprom.h"
+#include "ap_uv.h"
+#include "ap_ir.h"
+
+/* ========================================================================== */
+/*                          命令宏定义                                         */
+/* ========================================================================== */
+
+#define CMD_BUF_SIZE        128
+#define CMD_MAX_ARGC        8
+#define CMD_END             "\r\n"
+#define CMD_END_LEN         (sizeof(CMD_END) - 1)
+
+#define CMD_PRINTF(...)     BSP_UART_Printf(__VA_ARGS__)
+
+/* ========================================================================== */
+/*                          内部变量                                           */
+/* ========================================================================== */
+
+static char cmd_buf[CMD_BUF_SIZE];
+static uint8_t cmd_index = 0;
+
+/* ========================================================================== */
+/*                          命令处理函数声明                                    */
+/* ========================================================================== */
+
+typedef void (*cmd_handler_t)(int argc, char **argv);
+
+static void cmd_help(int argc, char **argv);
+static void cmd_adc(int argc, char **argv);
+static void cmd_uv(int argc, char **argv);
+static void cmd_param(int argc, char **argv);
+static void cmd_state(int argc, char **argv);
+static void cmd_reset(int argc, char **argv);
+static void cmd_debug(int argc, char **argv);
+static void cmd_unknown(int argc, char **argv);
+
+/* ========================================================================== */
+/*                          命令表                                             */
+/* ========================================================================== */
+
+typedef struct {
+    const char *name;
+    cmd_handler_t handler;
+} cmd_entry_t;
+
+static const cmd_entry_t cmd_table[] = {
+    {"help",   cmd_help},
+    {"adc",    cmd_adc},
+    {"uv",     cmd_uv},
+    {"param",  cmd_param},
+    {"state",  cmd_state},
+    {"reset",  cmd_reset},
+    {"debug",  cmd_debug},
+    {NULL,     cmd_unknown},
+};
+
+/* ========================================================================== */
+/*                          process_cmd_line — 解析 + 查表分发                 */
+/* ========================================================================== */
+
+static void process_cmd_line(const char *line)
+{
+    char *argv[CMD_MAX_ARGC];
+    int argc = 0;
+    static char cmd_copy[CMD_BUF_SIZE];
+
+    strncpy(cmd_copy, line, sizeof(cmd_copy));
+    cmd_copy[sizeof(cmd_copy) - 1] = '\0';
+
+    char *token = strtok(cmd_copy, " ");
+    while (token && argc < CMD_MAX_ARGC) {
+        argv[argc++] = token;
+        token = strtok(NULL, " ");
+    }
+
+    if (argc == 0)
+        return;
+
+    for (const cmd_entry_t *entry = cmd_table; entry->name; entry++) {
+        if (strcmp(argv[0], entry->name) == 0) {
+            entry->handler(argc, argv);
+            return;
+        }
+    }
+
+    cmd_unknown(argc, argv);
+}
+
+/* ========================================================================== */
+/*                         公有 API                                            */
+/* ========================================================================== */
+
+void cmd_parser_task(void)
+{
+    uint8_t ch;
+
+    while (BSP_UART_Read(BSP_UART_COM, &ch, 1) == 1) {
+        if (cmd_index + 1 >= CMD_END_LEN) {
+            if (memcmp(&cmd_buf[cmd_index + 1 - CMD_END_LEN], CMD_END, CMD_END_LEN - 1) == 0 &&
+                ch == CMD_END[CMD_END_LEN - 1]) {
+                cmd_buf[cmd_index + 1 - CMD_END_LEN] = '\0';
+                process_cmd_line((char *)cmd_buf);
+                cmd_index = 0;
+                continue;
+            }
+        }
+
+        if (cmd_index < CMD_BUF_SIZE - 1) {
+            cmd_buf[cmd_index++] = ch;
+        } else {
+            cmd_index = 0;
+        }
+    }
+}
+
+/* ========================================================================== */
+/*                          帮助命令                                            */
+/* ========================================================================== */
+
+static void cmd_help(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    CMD_PRINTF("Available commands:\r\n");
+    CMD_PRINTF("  help                     — print this help\r\n");
+    CMD_PRINTF("  param                    — show all module parameters\r\n");
+    CMD_PRINTF("  param uv <field> [value] — UV parameter (sensitivity/minmax/thr_*/win_*...)\r\n");
+    CMD_PRINTF("  param ir <idx> <field>   — IR channel parameter (idx=0~2)\r\n");
+    CMD_PRINTF("  param ir <idx> <set>     — IR channel parameter set\r\n");
+    CMD_PRINTF("  adc <ch>                 — read ADC channel raw value\r\n");
+    CMD_PRINTF("  adc threshold <ch> <val> — set ADC threshold\r\n");
+    CMD_PRINTF("  uv                       — print UV detector state\r\n");
+    CMD_PRINTF("  state                    — print system state\r\n");
+    CMD_PRINTF("  reset                    — software reset MCU\r\n");
+    CMD_PRINTF("  debug <on/off>           — toggle debug print\r\n");
+}
+
+/* ========================================================================== */
+/*                         cmd_param — 二级模块分发                             */
+/*         param uv|ir <field> [value] / param adc threshold <ch> <val>       */
+/* ========================================================================== */
+
+static void cmd_param_uv(int argc, char **argv);
+static void cmd_param_ir(int argc, char **argv);
+
+static void cmd_param(int argc, char **argv)
+{
+    if (argc == 1) {
+        const AP_EEPROM_UV_Param_t *uv = AP_EEPROM_UV_Get();
+        const AP_EEPROM_IR_Param_t  *ir = AP_EEPROM_IR_Get();
+        const AP_EEPROM_ADC_Param_t *adc = AP_EEPROM_ADC_Get();
+
+        CMD_PRINTF("--- UV (min→max) ---\r\n");
+        CMD_PRINTF("  level=%lu\r\n", (unsigned long)uv->sensitivity);
+        CMD_PRINTF("  thr: %lu→%lu\r\n", (unsigned long)uv->thr_min, (unsigned long)uv->thr_max);
+        CMD_PRINTF("  win: %lu→%lu\r\n", (unsigned long)uv->win_min, (unsigned long)uv->win_max);
+        CMD_PRINTF("  cfm: %lu→%lu\r\n", (unsigned long)uv->cfm_min, (unsigned long)uv->cfm_max);
+        CMD_PRINTF("  clr: %lu→%lu\r\n", (unsigned long)uv->clr_min, (unsigned long)uv->clr_max);
+        CMD_PRINTF("--- IR ---\r\n");
+        for (uint32_t i = 0; i < 3; i++) {
+            CMD_PRINTF("  ch%lu: thr=%lu hyst=%lu flt=%lu\r\n",
+                (unsigned long)i,
+                (unsigned long)ir->ch[i].threshold,
+                (unsigned long)ir->ch[i].hysteresis,
+                (unsigned long)ir->ch[i].filter_shift);
+        }
+        CMD_PRINTF("--- ADC thresholds ---\r\n");
+        CMD_PRINTF("  ch0=%lu ch1=%lu ch2=%lu\r\n",
+            (unsigned long)adc->threshold[0],
+            (unsigned long)adc->threshold[1],
+            (unsigned long)adc->threshold[2]);
+        return;
+    }
+
+    if (argc < 2) { CMD_PRINTF("Usage: param uv|ir|adc ...\r\n"); return; }
+
+    if (strcmp(argv[1], "uv") == 0) {
+        cmd_param_uv(argc - 1, argv + 1);
+    } else if (strcmp(argv[1], "ir") == 0) {
+        cmd_param_ir(argc - 1, argv + 1);
+    } else if (strcmp(argv[1], "adc") == 0) {
+        if (argc < 3) { CMD_PRINTF("Usage: param adc threshold <ch> <val>\r\n"); return; }
+        CMD_PRINTF("(use 'adc threshold <ch> <val>')\r\n");
+    } else {
+        CMD_PRINTF("Unknown module '%s' (try uv/ir/adc)\r\n", argv[1]);
+    }
+}
+
+/* =================================================================== */
+/*   param uv <field> [value]                                         */
+/* =================================================================== */
+
+// /* 内部辅助：将 AP_UV 实时 min/max 覆盖回待保存的 EEPROM 结构体 */
+// static void uv_sync_minmax(AP_EEPROM_UV_Param_t *p)
+// {
+//     AP_UV_GetConfig(&p->thr_min, &p->thr_max,
+//                     &p->win_min, &p->win_max,
+//                     &p->cfm_min, &p->cfm_max,
+//                     &p->clr_min, &p->clr_max);
+// }
+
+static void cmd_param_uv(int argc, char **argv)
+{
+    const AP_EEPROM_UV_Param_t *uv = AP_EEPROM_UV_Get();
+
+    if (argc == 1) {
+        uint32_t thr_min, thr_max, win_min, win_max;
+        uint32_t cfm_min, cfm_max, clr_min, clr_max;
+        uint32_t thr, win, cfm, clr;
+        AP_UV_GetConfig(&thr_min, &thr_max, &win_min, &win_max,
+                        &cfm_min, &cfm_max, &clr_min, &clr_max);
+        AP_UV_GetParams(&thr, &win, &cfm, &clr);
+
+        CMD_PRINTF("UV level=%lu\r\n", (unsigned long)uv->sensitivity);
+        CMD_PRINTF("         min→max    cur\r\n");
+        CMD_PRINTF("  thr:   %lu→%-8lu %lu\r\n",
+            (unsigned long)thr_min, (unsigned long)thr_max, (unsigned long)thr);
+        CMD_PRINTF("  win:   %lu→%-8lu %lu\r\n",
+            (unsigned long)win_min, (unsigned long)win_max, (unsigned long)win);
+        CMD_PRINTF("  cfm:   %lu→%-8lu %lu\r\n",
+            (unsigned long)cfm_min, (unsigned long)cfm_max, (unsigned long)cfm);
+        CMD_PRINTF("  clr:   %lu→%-8lu %lu\r\n",
+            (unsigned long)clr_min, (unsigned long)clr_max, (unsigned long)clr);
+        return;
+    }
+
+    if (strcmp(argv[1], "sensitivity") == 0) {
+        if (argc == 2) {
+            CMD_PRINTF("sensitivity=%lu\r\n", (unsigned long)uv->sensitivity);
+        } else {
+            uint32_t lv = strtoul(argv[2], NULL, 0);
+            if (lv > 9) lv = 9;
+
+            AP_UV_SetLevel((uint8_t)lv);          /* 插值计算所有参数 */
+
+            AP_EEPROM_UV_Param_t p = *uv;
+            p.sensitivity = lv;
+            if (AP_EEPROM_UV_Save(&p) == 0) {
+                CMD_PRINTF("sensitivity=%lu saved\r\n", (unsigned long)p.sensitivity);
+            } else { CMD_PRINTF("save failed\r\n"); }
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "minmax") == 0) {
+        uint32_t thr_min, thr_max, win_min, win_max;
+        uint32_t cfm_min, cfm_max, clr_min, clr_max;
+        AP_UV_GetConfig(&thr_min, &thr_max, &win_min, &win_max,
+                        &cfm_min, &cfm_max, &clr_min, &clr_max);
+        CMD_PRINTF("thr  %lu %lu\r\n", (unsigned long)thr_min, (unsigned long)thr_max);
+        CMD_PRINTF("win  %lu %lu\r\n", (unsigned long)win_min, (unsigned long)win_max);
+        CMD_PRINTF("cfm  %lu %lu\r\n", (unsigned long)cfm_min, (unsigned long)cfm_max);
+        CMD_PRINTF("clr  %lu %lu\r\n", (unsigned long)clr_min, (unsigned long)clr_max);
+        return;
+    }
+
+    /* 修改 min/max 值 */
+    {
+        int found = 1;
+        AP_EEPROM_UV_Param_t p = *uv;
+        const char *field = argv[1];
+
+        if (strcmp(field, "thr_min") == 0 && argc > 2) { p.thr_min = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "thr_max") == 0 && argc > 2) { p.thr_max = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "win_min") == 0 && argc > 2) { p.win_min = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "win_max") == 0 && argc > 2) { p.win_max = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "cfm_min") == 0 && argc > 2) { p.cfm_min = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "cfm_max") == 0 && argc > 2) { p.cfm_max = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "clr_min") == 0 && argc > 2) { p.clr_min = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "clr_max") == 0 && argc > 2) { p.clr_max = strtoul(argv[2], NULL, 0); }
+        else { found = 0; }
+
+        if (found) {
+            AP_UV_SetConfig(p.thr_min, p.thr_max, p.win_min, p.win_max,
+                            p.cfm_min, p.cfm_max, p.clr_min, p.clr_max);
+            AP_UV_SetLevel((uint8_t)p.sensitivity);
+
+            if (AP_EEPROM_UV_Save(&p) == 0) {
+                CMD_PRINTF("%s saved (set level to re-calc)\r\n", field);
+            } else { CMD_PRINTF("save failed\r\n"); }
+            return;
+        }
+    }
+
+    CMD_PRINTF("Unknown UV field: %s (try sensitivity/minmax/thr_min/thr_max/win_min/...)\r\n", argv[1]);
+}
+
+/* =================================================================== */
+/*   param ir <idx> <field> [value]                                    */
+/* =================================================================== */
+
+static void cmd_param_ir(int argc, char **argv)
+{ 
+    const AP_EEPROM_IR_Param_t *ir = AP_EEPROM_IR_Get();
+
+    if (argc < 2) {
+        for (uint32_t i = 0; i < 3; i++) {
+            CMD_PRINTF("IR%lu: thr=%lu hyst=%lu flt=%lu\r\n",
+                (unsigned long)i,
+                (unsigned long)ir->ch[i].threshold,
+                (unsigned long)ir->ch[i].hysteresis,
+                (unsigned long)ir->ch[i].filter_shift);
+        }
+        return;
+    }
+
+    uint32_t idx = (uint32_t)strtoul(argv[1], NULL, 0);
+    if (idx > 2) { CMD_PRINTF("idx must be 0~2\r\n"); return; }
+
+    if (argc == 2) {
+        CMD_PRINTF("IR%lu: thr=%lu hyst=%lu flt=%lu\r\n",
+            (unsigned long)idx,
+            (unsigned long)ir->ch[idx].threshold,
+            (unsigned long)ir->ch[idx].hysteresis,
+            (unsigned long)ir->ch[idx].filter_shift);
+        return;
+    }
+
+    if (strcmp(argv[2], "threshold") == 0) {
+        if (argc == 3) {
+            CMD_PRINTF("IR%lu threshold=%lu\r\n", (unsigned long)idx,
+                (unsigned long)ir->ch[idx].threshold);
+        } else {
+            AP_EEPROM_IR_Param_t p = *ir;
+            p.ch[idx].threshold = (uint32_t)strtoul(argv[3], NULL, 0);
+            if (AP_EEPROM_IR_Save(&p) == 0) {
+                CMD_PRINTF("IR%lu threshold=%lu saved\r\n",
+                    (unsigned long)idx, (unsigned long)p.ch[idx].threshold);
+            } else { CMD_PRINTF("save failed\r\n"); }
+        }
+    } else if (strcmp(argv[2], "hysteresis") == 0) {
+        if (argc == 3) {
+            CMD_PRINTF("IR%lu hysteresis=%lu\r\n", (unsigned long)idx,
+                (unsigned long)ir->ch[idx].hysteresis);
+        } else {
+            AP_EEPROM_IR_Param_t p = *ir;
+            p.ch[idx].hysteresis = (uint32_t)strtoul(argv[3], NULL, 0);
+            if (AP_EEPROM_IR_Save(&p) == 0) {
+                CMD_PRINTF("IR%lu hysteresis=%lu saved\r\n",
+                    (unsigned long)idx, (unsigned long)p.ch[idx].hysteresis);
+            } else { CMD_PRINTF("save failed\r\n"); }
+        }
+    } else if (strcmp(argv[2], "filter") == 0) {
+        if (argc == 3) {
+            CMD_PRINTF("IR%lu filter_shift=%lu\r\n", (unsigned long)idx,
+                (unsigned long)ir->ch[idx].filter_shift);
+        } else {
+            AP_EEPROM_IR_Param_t p = *ir;
+            p.ch[idx].filter_shift = (uint32_t)strtoul(argv[3], NULL, 0);
+            if (AP_EEPROM_IR_Save(&p) == 0) {
+                CMD_PRINTF("IR%lu filter_shift=%lu saved\r\n",
+                    (unsigned long)idx, (unsigned long)p.ch[idx].filter_shift);
+            } else { CMD_PRINTF("save failed\r\n"); }
+        }
+    } else {
+        CMD_PRINTF("Unknown IR field: %s (try threshold/hysteresis/filter)\r\n", argv[2]);
+    }
+}
+
+/* ========================================================================== */
+/*                         uv — 紫外检测状态                                    */
+/* ========================================================================== */
+
+static void cmd_uv(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    const char *s;
+    switch (AP_UV_GetState()) {
+        case UV_STATE_IDLE:    s = "IDLE";    break;
+        case UV_STATE_WARNING: s = "WARNING"; break;
+        case UV_STATE_FIRE:    s = "FIRE";    break;
+        default:               s = "?";       break;
+    }
+    CMD_PRINTF("UV state: %s\r\n", s);
+}
+
+/* ========================================================================== */
+/*                         adc — ADC 阈值设置                                   */
+/* ========================================================================== */
+
+static void cmd_adc(int argc, char **argv)
+{
+    const AP_EEPROM_ADC_Param_t *adc = AP_EEPROM_ADC_Get();
+
+    if (argc == 1) {
+        for (uint32_t i = 0; i < 3; i++) {
+            CMD_PRINTF("ADC%lu threshold: %lu\r\n",
+                (unsigned long)i, (unsigned long)adc->threshold[i]);
+        }
+        return;
+    }
+
+    /* adc threshold <ch> <val> */
+    if (argc == 4 && strcmp(argv[1], "threshold") == 0) {
+        uint32_t ch = (uint32_t)strtoul(argv[2], NULL, 0);
+        if (ch > 2) {
+            CMD_PRINTF("ch must be 0~2\r\n");
+            return;
+        }
+        AP_EEPROM_ADC_Param_t p = *adc;
+        p.threshold[ch] = (uint32_t)strtoul(argv[3], NULL, 0);
+        if (AP_EEPROM_ADC_Save(&p) == 0) {
+            CMD_PRINTF("ADC%lu threshold=%lu saved\r\n",
+                (unsigned long)ch, (unsigned long)p.threshold[ch]);
+        } else {
+            CMD_PRINTF("save failed\r\n");
+        }
+        return;
+    }
+
+    CMD_PRINTF("Usage: adc threshold <ch=0~2> <value>\r\n");
+}
+
+/* ========================================================================== */
+/*                         状态命令                                            */
+/* ========================================================================== */
+
+static void cmd_state(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    const AP_EEPROM_UV_Param_t *uv = AP_EEPROM_UV_Get();
+    const AP_EEPROM_IR_Param_t  *ir = AP_EEPROM_IR_Get();
+    const AP_EEPROM_ADC_Param_t *adc = AP_EEPROM_ADC_Get();
+    uint32_t tick = HAL_GetTick();
+
+    uint32_t uv_thr, uv_win, uv_cfm, uv_clr;
+    AP_UV_GetParams(&uv_thr, &uv_win, &uv_cfm, &uv_clr);
+
+    CMD_PRINTF("System state (uptime=%lums):\r\n", (unsigned long)tick);
+    CMD_PRINTF("  UV: st=%u lv=%lu thr=%lu win=%lu cfm=%lu clr=%lu\r\n",
+        (unsigned)AP_UV_GetState(),
+        (unsigned long)uv->sensitivity, (unsigned long)uv_thr,
+        (unsigned long)uv_win, (unsigned long)uv_cfm, (unsigned long)uv_clr);
+    CMD_PRINTF("  IR thr: %lu/%lu/%lu\r\n",
+        (unsigned long)ir->ch[0].threshold,
+        (unsigned long)ir->ch[1].threshold,
+        (unsigned long)ir->ch[2].threshold);
+    CMD_PRINTF("  ADC thr: %lu/%lu/%lu\r\n",
+        (unsigned long)adc->threshold[0],
+        (unsigned long)adc->threshold[1],
+        (unsigned long)adc->threshold[2]);
+}
+
+/* ========================================================================== */
+/*                         reset                                                */
+/* ========================================================================== */
+
+static void cmd_reset(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    CMD_PRINTF("resetting...\r\n");
+    NVIC_SystemReset();
+}
+
+/* ========================================================================== */
+/*                         debug                                                */
+/* ========================================================================== */
+
+static void cmd_debug(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    CMD_PRINTF("debug: not implemented yet\r\n");
+}
+
+/* ========================================================================== */
+/*                         未知命令                                             */
+/* ========================================================================== */
+
+static void cmd_unknown(int argc, char **argv)
+{
+    CMD_PRINTF("Unknown command: %s\r\n", argv[0]);
+    CMD_PRINTF("Type 'help' for available commands\r\n");
+}

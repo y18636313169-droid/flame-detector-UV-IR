@@ -4,15 +4,19 @@
   * @brief   AP 层紫外火焰检测模块
   *
   *          基于 TIM3 捕获的 C10807 UV 脉冲，利用时间窗口计数和状态机
-  *          决策火焰报警。支持 10 级灵敏度动态可调。
+  *          决策火焰报警。
   *
-  *          实例在模块内部静态定义，外部直接调用 API 即可。
+  *          参数通过 min/max 范围 + 灵敏度等级线性插值计算：
+  *            level=0 → 使用各参数的 min 值
+  *            level=9 → 使用各参数的 max 值
+  *            中间等级线性插值
   *
   *          == 使用示例 ==
-  *          AP_UV_Init(5, on_fire_alarm);     // 中灵敏度，注册回调
+  *          AP_UV_Init(5, on_fire_alarm);
+  *          AP_UV_SetConfig(5,35, 1000,3500, 0,3500, 3000,10000);
+  *          AP_UV_SetLevel(5);  // 自动计算各参数
   *          while (1) {
-  *              AP_UV_Process(HAL_GetTick());  // 内部自动 Feed
-  *              HAL_Delay(20);
+  *              AP_UV_Process(HAL_GetTick());
   *          }
   ******************************************************************************
   */
@@ -27,20 +31,10 @@ extern "C" {
 #include <stdbool.h>
 
 /* ========================================================================== */
-/*                          灵敏度宏定义                                       */
+/*                          常量宏                                             */
 /* ========================================================================== */
 
 #define UV_SENS_LEVELS          (10U)
-
-#define UV_WINDOW_MS_0          (3500U)
-#define UV_WINDOW_MS_9          (1000U)
-#define UV_THRESHOLD_0          (35U)
-#define UV_THRESHOLD_9          (5U)
-#define UV_CONFIRM_MS_0         (3500U)
-#define UV_CONFIRM_MS_9         (0U)
-#define UV_CLEAR_MS_0           (10000U)
-#define UV_CLEAR_MS_9           (3000U)
-
 #define UV_MAX_HISTORY          (20U)
 
 /* ========================================================================== */
@@ -57,12 +51,48 @@ typedef enum {
 /*                          API 声明                                           */
 /* ========================================================================== */
 
-void AP_UV_Init(uint8_t level, void (*on_fire)(void));
+void AP_UV_Init(void (*on_fire)(void));
 void AP_UV_Feed(void);
 void AP_UV_Process(uint32_t now);
+
+/**
+  * @brief  设置 4 项检测参数的 min/max 范围（即等级 0 和等级 9 的值）
+  *         供初始化或命令行修改 min/max 后调用。
+  *         设置后需调用 AP_UV_SetLevel 才能生效。
+  */
+void AP_UV_SetConfig(uint32_t thr_min, uint32_t thr_max,
+                     uint32_t win_min, uint32_t win_max,
+                     uint32_t cfm_min, uint32_t cfm_max,
+                     uint32_t clr_min, uint32_t clr_max);
+
+/**
+  * @brief  获取当前配置的 min/max 范围
+  */
+void AP_UV_GetConfig(uint32_t *thr_min, uint32_t *thr_max,
+                     uint32_t *win_min, uint32_t *win_max,
+                     uint32_t *cfm_min, uint32_t *cfm_max,
+                     uint32_t *clr_min, uint32_t *clr_max);
+
+/**
+  * @brief  设置灵敏度等级并自动线性插值计算各检测参数
+  * @param  level: 0~9
+  */
 void AP_UV_SetLevel(uint8_t level);
-void AP_UV_Reset(void);
+
+// /**
+//   * @brief  直接设置检测参数（跳过等级计算）
+//   */
+// void AP_UV_SetParams(uint32_t threshold, uint32_t window_ms,
+//                      uint32_t confirm_ms, uint32_t clear_ms);
+
+void AP_UV_Process_Reset(void);
 UV_DetectorState_t AP_UV_GetState(void);
+
+/**
+  * @brief  获取当前运行的检测参数
+  */
+void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
+                     uint32_t *confirm_ms, uint32_t *clear_ms);
 
 #ifdef __cplusplus
 }
