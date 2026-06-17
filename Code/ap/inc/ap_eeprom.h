@@ -69,24 +69,37 @@ typedef struct {
 } AP_EEPROM_UV_Param_t;
 
 /* ========================================================================== */
-/*                         3. IR 检测参数                                      */
+/*                         3. IR 检测参数 (多光谱融合算法)                     */
 /* ========================================================================== */
 
-#define EEPROM_IR_MAGIC     0x45495200UL       /* "EIR\0" */
+#define EEPROM_IR_MAGIC     0x45495232UL       /* "EIR2" — version 2 */
 
-/** @brief  单路 IR 检测参数 */
-typedef struct {
-    uint32_t    threshold;          /* ADC 原始值阈值 */
-    uint32_t    hysteresis;         /* 回滞值 */
-    uint32_t    filter_shift;       /* 滤波系数（右移位数，0=无滤波） */
-    uint32_t    _reserved;          /* 预留 */
-} AP_EEPROM_IR_ChanParam_t;
+/**
+  @brief  IR 多光谱融合检测参数
+          功率/光谱比/确认时长以 min/max 范围存储，灵敏度 0~9 级线性插值。
+          频率范围为固定值(火焰闪烁频率不随灵敏度变化)。
 
+          缩放约定:
+            pwr_xxx = 平均功率均方值 ×1000  (e.g. 1500 = 1.500)
+            r38/r50 = 光谱比 ×1000          (e.g. 1500 = 1.500)
+            freq_xxx = 频率 ×10             (e.g. 15 = 1.5Hz)
+            cfm = 确认时长 毫秒
+*/
 typedef struct {
-    uint32_t    magic;
-    uint32_t    version;
-    uint32_t    length;
-    AP_EEPROM_IR_ChanParam_t ch[3]; /* 3 路 IR 通道参数 */
+    uint32_t    magic;              /* EEPROM_IR_MAGIC       */
+    uint32_t    version;            /* 2                     */
+    uint32_t    length;             /* sizeof                 */
+    uint32_t    sensitivity;        /* 0~9                   */
+    uint32_t    pwr_min;            /* 功率阈值(×1000) 等级0   */
+    uint32_t    pwr_max;            /* 功率阈值(×1000) 等级9   */
+    uint32_t    r38_min;            /* R4.5/3.8(×1000) 等级0  */
+    uint32_t    r38_max;            /* R4.5/3.8(×1000) 等级9  */
+    uint32_t    r50_min;            /* R4.5/5.0(×1000) 等级0  */
+    uint32_t    r50_max;            /* R4.5/5.0(×1000) 等级9  */
+    uint32_t    freq_low_x10;       /* 频率下限(×10)   固定  */
+    uint32_t    freq_high_x10;      /* 频率上限(×10)   固定  */
+    uint32_t    cfm_min;            /* 确认时长(ms)    等级0  */
+    uint32_t    cfm_max;            /* 确认时长(ms)    等级9  */
     uint16_t    crc16;
     uint16_t    _pad;
 } AP_EEPROM_IR_Param_t;
@@ -105,9 +118,18 @@ typedef struct {
 #define AP_EEPROM_UV_DEFAULT_CLR_MIN   3000U
 #define AP_EEPROM_UV_DEFAULT_CLR_MAX   10000U
 
-#define AP_EEPROM_IR_DEFAULT_THRESHOLD      2000U
-#define AP_EEPROM_IR_DEFAULT_HYSTERESIS     100U
-#define AP_EEPROM_IR_DEFAULT_FILTER_SHIFT   2U
+/* IR 多光谱融合默认值 (中灵敏度, 对应文档Ⅱ级) */
+#define AP_EEPROM_IR_DEFAULT_SENS      5U
+#define AP_EEPROM_IR_DEFAULT_PWR_MIN   800U     /* 0.8  ×1000 */
+#define AP_EEPROM_IR_DEFAULT_PWR_MAX   4000U    /* 4.0  ×1000 */
+#define AP_EEPROM_IR_DEFAULT_R38_MIN   1000U    /* 1.0  ×1000 */
+#define AP_EEPROM_IR_DEFAULT_R38_MAX   2000U    /* 2.0  ×1000 */
+#define AP_EEPROM_IR_DEFAULT_R50_MIN   800U     /* 0.8  ×1000 */
+#define AP_EEPROM_IR_DEFAULT_R50_MAX   1800U    /* 1.8  ×1000 */
+#define AP_EEPROM_IR_DEFAULT_FREQ_LOW  15U      /* 1.5Hz ×10 (固定) */
+#define AP_EEPROM_IR_DEFAULT_FREQ_HIGH 200U     /* 20Hz ×10 (固定) */
+#define AP_EEPROM_IR_DEFAULT_CFM_MIN   200U     /* 200ms */
+#define AP_EEPROM_IR_DEFAULT_CFM_MAX   3000U    /* 3000ms */
 
 /* ========================================================================== */
 /*                        公有 API                                             */

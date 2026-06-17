@@ -53,6 +53,13 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+#define IR_TEST_MODE    /* 测试模式: 仅采集ADC+UV原始数据，不运行检测算法 */
+
+#if defined(IR_TEST_MODE)
+void TEST_SetPrintEnabled(uint8_t en);
+uint8_t TEST_GetPrintEnabled(void);
+void TEST_InsertMarker(const char *msg);
+#endif
 
 /* USER CODE END EFP */
 
@@ -61,6 +68,7 @@ void Error_Handler(void);
 #define LED_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
+
 
 /* USER CODE END Private defines */
 

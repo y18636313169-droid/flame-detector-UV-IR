@@ -7,6 +7,7 @@
 #include "ap_eeprom.h"
 #include "ap_uv.h"
 #include "ap_ir.h"
+#include "main.h"
 
 /* ========================================================================== */
 /*                          命令宏定义                                         */
@@ -35,10 +36,12 @@ typedef void (*cmd_handler_t)(int argc, char **argv);
 static void cmd_help(int argc, char **argv);
 static void cmd_adc(int argc, char **argv);
 static void cmd_uv(int argc, char **argv);
+static void cmd_ir(int argc, char **argv);
 static void cmd_param(int argc, char **argv);
 static void cmd_state(int argc, char **argv);
 static void cmd_reset(int argc, char **argv);
 static void cmd_debug(int argc, char **argv);
+static void cmd_mark(int argc, char **argv);
 static void cmd_unknown(int argc, char **argv);
 
 /* ========================================================================== */
@@ -54,10 +57,12 @@ static const cmd_entry_t cmd_table[] = {
     {"help",   cmd_help},
     {"adc",    cmd_adc},
     {"uv",     cmd_uv},
+    {"ir",     cmd_ir},
     {"param",  cmd_param},
     {"state",  cmd_state},
     {"reset",  cmd_reset},
     {"debug",  cmd_debug},
+    {"mark",   cmd_mark},
     {NULL,     cmd_unknown},
 };
 
@@ -131,15 +136,16 @@ static void cmd_help(int argc, char **argv)
     CMD_PRINTF("Available commands:\r\n");
     CMD_PRINTF("  help                     — print this help\r\n");
     CMD_PRINTF("  param                    — show all module parameters\r\n");
-    CMD_PRINTF("  param uv <field> [value] — UV parameter (sensitivity/minmax/thr_*/win_*...)\r\n");
-    CMD_PRINTF("  param ir <idx> <field>   — IR channel parameter (idx=0~2)\r\n");
-    CMD_PRINTF("  param ir <idx> <set>     — IR channel parameter set\r\n");
+    CMD_PRINTF("  param uv <field> [value] — UV parameter (sensitivity/minmax/...)\r\n");
+    CMD_PRINTF("  param ir <field> [value] — IR parameter (sensitivity/pwr/r38/r50/freq/...)\r\n");
     CMD_PRINTF("  adc <ch>                 — read ADC channel raw value\r\n");
     CMD_PRINTF("  adc threshold <ch> <val> — set ADC threshold\r\n");
     CMD_PRINTF("  uv                       — print UV detector state\r\n");
+    CMD_PRINTF("  ir                       — print IR state & features\r\n");
     CMD_PRINTF("  state                    — print system state\r\n");
     CMD_PRINTF("  reset                    — software reset MCU\r\n");
-    CMD_PRINTF("  debug <on/off>           — toggle debug print\r\n");
+    CMD_PRINTF("  debug <on/off>           — toggle 100Hz test data print\r\n");
+    CMD_PRINTF("  mark [text]              — insert scenario marker with optional text\r\n");
 }
 
 /* ========================================================================== */
@@ -163,14 +169,18 @@ static void cmd_param(int argc, char **argv)
         CMD_PRINTF("  win: %lu→%lu\r\n", (unsigned long)uv->win_min, (unsigned long)uv->win_max);
         CMD_PRINTF("  cfm: %lu→%lu\r\n", (unsigned long)uv->cfm_min, (unsigned long)uv->cfm_max);
         CMD_PRINTF("  clr: %lu→%lu\r\n", (unsigned long)uv->clr_min, (unsigned long)uv->clr_max);
-        CMD_PRINTF("--- IR ---\r\n");
-        for (uint32_t i = 0; i < 3; i++) {
-            CMD_PRINTF("  ch%lu: thr=%lu hyst=%lu flt=%lu\r\n",
-                (unsigned long)i,
-                (unsigned long)ir->ch[i].threshold,
-                (unsigned long)ir->ch[i].hysteresis,
-                (unsigned long)ir->ch[i].filter_shift);
-        }
+        CMD_PRINTF("--- IR (min→max) ---\r\n");
+        CMD_PRINTF("  level=%lu\r\n", (unsigned long)ir->sensitivity);
+        CMD_PRINTF("  pwr:  %lu→%lu (×1000)\r\n",
+            (unsigned long)ir->pwr_min, (unsigned long)ir->pwr_max);
+        CMD_PRINTF("  r38:  %lu→%lu (×1000)\r\n",
+            (unsigned long)ir->r38_min, (unsigned long)ir->r38_max);
+        CMD_PRINTF("  r50:  %lu→%lu (×1000)\r\n",
+            (unsigned long)ir->r50_min, (unsigned long)ir->r50_max);
+        CMD_PRINTF("  freq: low=%lu high=%lu (×10,固定)\r\n",
+            (unsigned long)ir->freq_low_x10, (unsigned long)ir->freq_high_x10);
+        CMD_PRINTF("  cfm:  %lu→%lu (ms)\r\n",
+            (unsigned long)ir->cfm_min, (unsigned long)ir->cfm_max);
         CMD_PRINTF("--- ADC thresholds ---\r\n");
         CMD_PRINTF("  ch0=%lu ch1=%lu ch2=%lu\r\n",
             (unsigned long)adc->threshold[0],
@@ -293,75 +303,104 @@ static void cmd_param_uv(int argc, char **argv)
 }
 
 /* =================================================================== */
-/*   param ir <idx> <field> [value]                                    */
+/*   param ir <field> [value] — 多光谱融合参数                          */
 /* =================================================================== */
 
 static void cmd_param_ir(int argc, char **argv)
-{ 
+{
     const AP_EEPROM_IR_Param_t *ir = AP_EEPROM_IR_Get();
 
-    if (argc < 2) {
-        for (uint32_t i = 0; i < 3; i++) {
-            CMD_PRINTF("IR%lu: thr=%lu hyst=%lu flt=%lu\r\n",
-                (unsigned long)i,
-                (unsigned long)ir->ch[i].threshold,
-                (unsigned long)ir->ch[i].hysteresis,
-                (unsigned long)ir->ch[i].filter_shift);
+    if (argc == 1) {
+        uint32_t pwr_min, pwr_max, r38_min, r38_max;
+        uint32_t r50_min, r50_max, freq_low, freq_high;
+        uint32_t cfm_min, cfm_max;
+        uint32_t pwr, r38, r50, cfm;
+        AP_IR_GetConfig(&pwr_min, &pwr_max, &r38_min, &r38_max,
+                        &r50_min, &r50_max, &freq_low, &freq_high,
+                        &cfm_min, &cfm_max);
+        AP_IR_GetParams(&pwr, &r38, &r50, &freq_low, &freq_high, &cfm);
+
+        CMD_PRINTF("IR level=%lu\r\n", (unsigned long)ir->sensitivity);
+        CMD_PRINTF("         min→max    cur\r\n");
+        CMD_PRINTF("  pwr:   %lu→%-8lu %lu\r\n",
+            (unsigned long)pwr_min, (unsigned long)pwr_max, (unsigned long)pwr);
+        CMD_PRINTF("  r38:   %lu→%-8lu %lu\r\n",
+            (unsigned long)r38_min, (unsigned long)r38_max, (unsigned long)r38);
+        CMD_PRINTF("  r50:   %lu→%-8lu %lu\r\n",
+            (unsigned long)r50_min, (unsigned long)r50_max, (unsigned long)r50);
+        CMD_PRINTF("  freq:  low=%lu high=%lu (×10,固定)\r\n",
+            (unsigned long)freq_low, (unsigned long)freq_high);
+        CMD_PRINTF("  cfm:   %lu→%-8lu %lu\r\n",
+            (unsigned long)cfm_min, (unsigned long)cfm_max, (unsigned long)cfm);
+        return;
+    }
+
+    if (strcmp(argv[1], "sensitivity") == 0) {
+        if (argc == 2) {
+            CMD_PRINTF("sensitivity=%lu\r\n", (unsigned long)ir->sensitivity);
+        } else {
+            uint32_t lv = strtoul(argv[2], NULL, 0);
+            if (lv > 9) lv = 9;
+
+            AP_IR_SetLevel((uint8_t)lv);
+
+            AP_EEPROM_IR_Param_t p = *ir;
+            p.sensitivity = lv;
+            if (AP_EEPROM_IR_Save(&p) == 0) {
+                CMD_PRINTF("sensitivity=%lu saved\r\n", (unsigned long)p.sensitivity);
+            } else { CMD_PRINTF("save failed\r\n"); }
         }
         return;
     }
 
-    uint32_t idx = (uint32_t)strtoul(argv[1], NULL, 0);
-    if (idx > 2) { CMD_PRINTF("idx must be 0~2\r\n"); return; }
-
-    if (argc == 2) {
-        CMD_PRINTF("IR%lu: thr=%lu hyst=%lu flt=%lu\r\n",
-            (unsigned long)idx,
-            (unsigned long)ir->ch[idx].threshold,
-            (unsigned long)ir->ch[idx].hysteresis,
-            (unsigned long)ir->ch[idx].filter_shift);
+    if (strcmp(argv[1], "minmax") == 0) {
+        uint32_t pwr_min, pwr_max, r38_min, r38_max;
+        uint32_t r50_min, r50_max, freq_low, freq_high;
+        uint32_t cfm_min, cfm_max;
+        AP_IR_GetConfig(&pwr_min, &pwr_max, &r38_min, &r38_max,
+                        &r50_min, &r50_max, &freq_low, &freq_high,
+                        &cfm_min, &cfm_max);
+        CMD_PRINTF("pwr  %lu %lu\r\n", (unsigned long)pwr_min, (unsigned long)pwr_max);
+        CMD_PRINTF("r38  %lu %lu\r\n", (unsigned long)r38_min, (unsigned long)r38_max);
+        CMD_PRINTF("r50  %lu %lu\r\n", (unsigned long)r50_min, (unsigned long)r50_max);
+        CMD_PRINTF("freq  %lu %lu\r\n", (unsigned long)freq_low, (unsigned long)freq_high);
+        CMD_PRINTF("cfm  %lu %lu\r\n", (unsigned long)cfm_min, (unsigned long)cfm_max);
         return;
     }
 
-    if (strcmp(argv[2], "threshold") == 0) {
-        if (argc == 3) {
-            CMD_PRINTF("IR%lu threshold=%lu\r\n", (unsigned long)idx,
-                (unsigned long)ir->ch[idx].threshold);
-        } else {
-            AP_EEPROM_IR_Param_t p = *ir;
-            p.ch[idx].threshold = (uint32_t)strtoul(argv[3], NULL, 0);
+    /* 修改 min/max 值 + 固定频率 */
+    {
+        int found = 1;
+        AP_EEPROM_IR_Param_t p = *ir;
+        const char *field = argv[1];
+
+        if (strcmp(field, "pwr_min") == 0 && argc > 2)      { p.pwr_min   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "pwr_max") == 0 && argc > 2)  { p.pwr_max   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "r38_min") == 0 && argc > 2)  { p.r38_min   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "r38_max") == 0 && argc > 2)  { p.r38_max   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "r50_min") == 0 && argc > 2)  { p.r50_min   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "r50_max") == 0 && argc > 2)  { p.r50_max   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "freq_low") == 0 && argc > 2) { p.freq_low_x10  = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "freq_high") == 0 && argc > 2){ p.freq_high_x10 = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "cfm_min") == 0 && argc > 2)  { p.cfm_min   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "cfm_max") == 0 && argc > 2)  { p.cfm_max   = strtoul(argv[2], NULL, 0); }
+        else { found = 0; }
+
+        if (found) {
+            AP_IR_SetConfig(p.pwr_min, p.pwr_max, p.r38_min, p.r38_max,
+                            p.r50_min, p.r50_max,
+                            p.freq_low_x10, p.freq_high_x10,
+                            p.cfm_min, p.cfm_max);
+            AP_IR_SetLevel((uint8_t)p.sensitivity);
+
             if (AP_EEPROM_IR_Save(&p) == 0) {
-                CMD_PRINTF("IR%lu threshold=%lu saved\r\n",
-                    (unsigned long)idx, (unsigned long)p.ch[idx].threshold);
+                CMD_PRINTF("%s saved\r\n", field);
             } else { CMD_PRINTF("save failed\r\n"); }
+            return;
         }
-    } else if (strcmp(argv[2], "hysteresis") == 0) {
-        if (argc == 3) {
-            CMD_PRINTF("IR%lu hysteresis=%lu\r\n", (unsigned long)idx,
-                (unsigned long)ir->ch[idx].hysteresis);
-        } else {
-            AP_EEPROM_IR_Param_t p = *ir;
-            p.ch[idx].hysteresis = (uint32_t)strtoul(argv[3], NULL, 0);
-            if (AP_EEPROM_IR_Save(&p) == 0) {
-                CMD_PRINTF("IR%lu hysteresis=%lu saved\r\n",
-                    (unsigned long)idx, (unsigned long)p.ch[idx].hysteresis);
-            } else { CMD_PRINTF("save failed\r\n"); }
-        }
-    } else if (strcmp(argv[2], "filter") == 0) {
-        if (argc == 3) {
-            CMD_PRINTF("IR%lu filter_shift=%lu\r\n", (unsigned long)idx,
-                (unsigned long)ir->ch[idx].filter_shift);
-        } else {
-            AP_EEPROM_IR_Param_t p = *ir;
-            p.ch[idx].filter_shift = (uint32_t)strtoul(argv[3], NULL, 0);
-            if (AP_EEPROM_IR_Save(&p) == 0) {
-                CMD_PRINTF("IR%lu filter_shift=%lu saved\r\n",
-                    (unsigned long)idx, (unsigned long)p.ch[idx].filter_shift);
-            } else { CMD_PRINTF("save failed\r\n"); }
-        }
-    } else {
-        CMD_PRINTF("Unknown IR field: %s (try threshold/hysteresis/filter)\r\n", argv[2]);
     }
+
+    CMD_PRINTF("Unknown IR field: %s (try sensitivity/minmax/pwr_min/pwr_max/r38_min/...)\r\n", argv[1]);
 }
 
 /* ========================================================================== */
@@ -380,6 +419,37 @@ static void cmd_uv(int argc, char **argv)
         default:               s = "?";       break;
     }
     CMD_PRINTF("UV state: %s\r\n", s);
+}
+
+/* ========================================================================== */
+/*                         ir — 红外三波段检测状态 + 实时特征                   */
+/* ========================================================================== */
+
+static void cmd_ir(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    const char *s;
+    switch (AP_IR_GetState()) {
+        case IR_STATE_IDLE:    s = "IDLE";    break;
+        case IR_STATE_WARNING: s = "WARNING"; break;
+        case IR_STATE_FIRE:    s = "FIRE";    break;
+        default:               s = "?";       break;
+    }
+    CMD_PRINTF("IR state: %s\r\n", s);
+
+    uint32_t power[3];
+    float    zcr[3];
+    uint32_t r45_38, r45_50;
+    AP_IR_GetFeatures(power, zcr, &r45_38, &r45_50);
+
+    CMD_PRINTF("  P[38]=%lu  P[45]=%lu  P[50]=%lu\r\n",
+        (unsigned long)power[0], (unsigned long)power[1], (unsigned long)power[2]);
+    CMD_PRINTF("  ZCR[38]=%.1fHz  ZCR[45]=%.1fHz  ZCR[50]=%.1fHz\r\n",
+        (double)zcr[0], (double)zcr[1], (double)zcr[2]);
+    CMD_PRINTF("  R45/38=%lu.%03lu  R45/50=%lu.%03lu\r\n",
+        (unsigned long)(r45_38 / 1000), (unsigned long)(r45_38 % 1000),
+        (unsigned long)(r45_50 / 1000), (unsigned long)(r45_50 % 1000));
 }
 
 /* ========================================================================== */
@@ -440,10 +510,14 @@ static void cmd_state(int argc, char **argv)
         (unsigned)AP_UV_GetState(),
         (unsigned long)uv->sensitivity, (unsigned long)uv_thr,
         (unsigned long)uv_win, (unsigned long)uv_cfm, (unsigned long)uv_clr);
-    CMD_PRINTF("  IR thr: %lu/%lu/%lu\r\n",
-        (unsigned long)ir->ch[0].threshold,
-        (unsigned long)ir->ch[1].threshold,
-        (unsigned long)ir->ch[2].threshold);
+    uint32_t ir_pwr, ir_r38, ir_r50, ir_flow, ir_fhigh, ir_cfm;
+    AP_IR_GetParams(&ir_pwr, &ir_r38, &ir_r50, &ir_flow, &ir_fhigh, &ir_cfm);
+
+    CMD_PRINTF("  IR: st=%u lv=%lu pwr=%lu r38=%lu r50=%lu freq=%lu/%lu cfm=%lu\r\n",
+        (unsigned)AP_IR_GetState(),
+        (unsigned long)ir->sensitivity, (unsigned long)ir_pwr,
+        (unsigned long)ir_r38, (unsigned long)ir_r50,
+        (unsigned long)ir_flow, (unsigned long)ir_fhigh, (unsigned long)ir_cfm);
     CMD_PRINTF("  ADC thr: %lu/%lu/%lu\r\n",
         (unsigned long)adc->threshold[0],
         (unsigned long)adc->threshold[1],
@@ -468,9 +542,41 @@ static void cmd_reset(int argc, char **argv)
 
 static void cmd_debug(int argc, char **argv)
 {
+#if defined(IR_TEST_MODE)
+    if (argc < 2) {
+        CMD_PRINTF("debug=%s\r\n", TEST_GetPrintEnabled() ? "on" : "off");
+        return;
+    }
+    if (strcmp(argv[1], "on") == 0) {
+        TEST_SetPrintEnabled(1);
+        CMD_PRINTF("debug on\r\n");
+    } else if (strcmp(argv[1], "off") == 0) {
+        TEST_SetPrintEnabled(0);
+        CMD_PRINTF("debug off\r\n");
+    } else {
+        CMD_PRINTF("Usage: debug on|off\r\n");
+    }
+#else
     (void)argc;
     (void)argv;
-    CMD_PRINTF("debug: not implemented yet\r\n");
+    CMD_PRINTF("debug: only available in IR_TEST_MODE\r\n");
+#endif
+}
+
+/* ========================================================================== */
+/*                         mark — 测试场景分隔标记                              */
+/* ========================================================================== */
+
+static void cmd_mark(int argc, char **argv)
+{
+#if defined(IR_TEST_MODE)
+    const char *msg = (argc > 1) ? argv[1] : NULL;
+    TEST_InsertMarker(msg);
+#else
+    (void)argc;
+    (void)argv;
+    CMD_PRINTF("mark: only available in IR_TEST_MODE\r\n");
+#endif
 }
 
 /* ========================================================================== */

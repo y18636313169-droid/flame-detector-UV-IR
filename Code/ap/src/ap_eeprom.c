@@ -11,6 +11,9 @@
 /* CRC 偏移辅助 */
 #define CRC_OFF(type, field)    ((uint16_t)(uintptr_t)&((type *)0)->field)
 
+/* IR 为 UV 风格多参数结构体，CRC 偏移辅助需单独定义(较长, 用宏内联) */
+#define IR_CRC_OFFSET   ((uint16_t)(uintptr_t)&((AP_EEPROM_IR_Param_t *)0)->crc16)
+
 /* ========================================================================== */
 /*                         内部变量                                            */
 /* ========================================================================== */
@@ -54,14 +57,20 @@ static void ir_defaults(void *buf)
 {
     AP_EEPROM_IR_Param_t *p = (AP_EEPROM_IR_Param_t *)buf;
     memset(p, 0, sizeof(*p));
-    p->magic   = EEPROM_IR_MAGIC;
-    p->version = 1;
-    p->length  = sizeof(AP_EEPROM_IR_Param_t);
-    for (uint32_t i = 0; i < 3; i++) {
-        p->ch[i].threshold     = AP_EEPROM_IR_DEFAULT_THRESHOLD;
-        p->ch[i].hysteresis    = AP_EEPROM_IR_DEFAULT_HYSTERESIS;
-        p->ch[i].filter_shift  = AP_EEPROM_IR_DEFAULT_FILTER_SHIFT;
-    }
+    p->magic       = EEPROM_IR_MAGIC;
+    p->version     = 2;
+    p->length      = sizeof(AP_EEPROM_IR_Param_t);
+    p->sensitivity = AP_EEPROM_IR_DEFAULT_SENS;
+    p->pwr_min     = AP_EEPROM_IR_DEFAULT_PWR_MIN;
+    p->pwr_max     = AP_EEPROM_IR_DEFAULT_PWR_MAX;
+    p->r38_min     = AP_EEPROM_IR_DEFAULT_R38_MIN;
+    p->r38_max     = AP_EEPROM_IR_DEFAULT_R38_MAX;
+    p->r50_min     = AP_EEPROM_IR_DEFAULT_R50_MIN;
+    p->r50_max     = AP_EEPROM_IR_DEFAULT_R50_MAX;
+    p->freq_low_x10  = AP_EEPROM_IR_DEFAULT_FREQ_LOW;
+    p->freq_high_x10 = AP_EEPROM_IR_DEFAULT_FREQ_HIGH;
+    p->cfm_min     = AP_EEPROM_IR_DEFAULT_CFM_MIN;
+    p->cfm_max     = AP_EEPROM_IR_DEFAULT_CFM_MAX;
 }
 
 /* ========================================================================== */
@@ -86,7 +95,7 @@ int AP_EEPROM_Init(void)
 
     if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
                                EEPROM_IR_MAGIC, ir_defaults,
-                               CRC_OFF(AP_EEPROM_IR_Param_t, crc16)) != 0) {
+                               IR_CRC_OFFSET) != 0) {
         ret = -1;
     }
 
@@ -149,12 +158,12 @@ int AP_EEPROM_IR_Save(const AP_EEPROM_IR_Param_t *p)
     if (p == NULL) return -1;
     memcpy(&s_ir, p, sizeof(s_ir));
     return BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
-                                  CRC_OFF(AP_EEPROM_IR_Param_t, crc16));
+                                  IR_CRC_OFFSET);
 }
 
 int AP_EEPROM_IR_Reset(void)
 {
     ir_defaults(&s_ir);
     return BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
-                                  CRC_OFF(AP_EEPROM_IR_Param_t, crc16));
+                                  IR_CRC_OFFSET);
 }
