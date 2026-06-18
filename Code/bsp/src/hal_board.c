@@ -17,6 +17,8 @@
 #include "hal_adc.h"
 #include "hal_tim.h"
 #include "hal_uart.h"
+#include "hal_alarm.h"
+#include "hal_led.h"
 
 /* ---------------------------------------------------------------------------*/
 /*                        公有 API 实现                                        */
@@ -28,6 +30,12 @@ int BSP_BoardInit(void)
     if (BSP_GPIO_Init() != BSP_GPIO_OK) {
         return BSP_BOARD_ERROR;
     }
+
+    /* 500ms闪烁灯 */
+    BSP_LED_Work(500);
+
+    /* 报警输出初始化（MX_GPIO_Init 后立即执行，防止启动期间误触发） */
+    BSP_ALARM_Init();
 
     /* ADC 初始化 */
     if (BSP_ADC_Init() != 0) {

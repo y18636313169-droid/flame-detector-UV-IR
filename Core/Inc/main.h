@@ -31,7 +31,7 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ap_util.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -53,7 +53,6 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-#define IR_TEST_MODE    /* 测试模式: 仅采集ADC+UV原始数据，不运行检测算法 */
 
 #if defined(IR_TEST_MODE)
 void TEST_SetPrintEnabled(uint8_t en);
@@ -64,7 +63,19 @@ void TEST_InsertMarker(const char *msg);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define LED_Pin GPIO_PIN_9
+#define IR_OUT_3_Pin GPIO_PIN_0
+#define IR_OUT_3_GPIO_Port GPIOC
+#define IR_OUT_2_Pin GPIO_PIN_1
+#define IR_OUT_2_GPIO_Port GPIOC
+#define IR_OUT_1_Pin GPIO_PIN_2
+#define IR_OUT_1_GPIO_Port GPIOC
+#define ALM2_Pin GPIO_PIN_0
+#define ALM2_GPIO_Port GPIOA
+#define ALM1_Pin GPIO_PIN_1
+#define ALM1_GPIO_Port GPIOA
+#define CHK_MODE_Pin GPIO_PIN_2
+#define CHK_MODE_GPIO_Port GPIOB
+#define LED_Pin GPIO_PIN_6
 #define LED_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */

@@ -54,6 +54,7 @@ typedef enum {
 void AP_UV_Init(void (*on_fire)(void));
 void AP_UV_Feed(void);
 void AP_UV_Process(uint32_t now);
+void AP_UV_Task(void);
 
 /**
   * @brief  设置 4 项检测参数的 min/max 范围（即等级 0 和等级 9 的值）

@@ -27,6 +27,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "hal_alarm.h"
 #include "hal_board.h"
 #include "hal_led.h"
 #include "hal_tim.h"
@@ -61,7 +62,6 @@
 /* USER CODE BEGIN PV */
 
 /* ISR → 主循环标志 (ISR 只置位, 主循环消费) */
-static volatile uint8_t  ap_adc_pending;        /* 10ms ADC 采样标志 */
 #if defined(IR_TEST_MODE)
 static volatile uint8_t  test_print_pending;    /* 10ms 测试打印标志 */
 static uint8_t           test_print_enabled;    /* CLI on/off 控制 */
@@ -78,31 +78,15 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/**
-  * @brief  ADC 采样任务 (主循环调用)
-  *         消费 ap_adc_pending 标志, 执行实际 ADC 数据读取和滑动滤波
-  */
-void adc_sample_task(void)
-{
-    if (!ap_adc_pending) return;
-    ap_adc_pending = 0;
-    AP_ADC_Update();
-}
-
 #if defined(IR_TEST_MODE)
 
 /**
-  * @brief  测试模式: 打印 ADC + UV 原始数据
-  *         100Hz 紧凑格式, 每行 T<ms> 前缀, 方便 PC 解析
+  * @brief  测试模式: 打印 UV 脉冲原始数据
+  *         100Hz 紧凑格式, 每行 T<ms> 前缀
   */
 static void test_print_data(void)
 {
     uint32_t tick = HAL_GetTick();
-
-    /* ADC 3 通道 */
-    BSP_UART_Printf("T%lu ADC %u %u %u\r\n",
-        (unsigned long)tick,
-        AP_ADC_GetLatest(0), AP_ADC_GetLatest(1), AP_ADC_GetLatest(2));
 
     /* UV 脉冲: 脉宽列表 */
     BSP_TIM_PulseData_t pulses[20];
@@ -179,7 +163,6 @@ int main(void)
   AP_UART_ProtocolInit();
 
   /* ISR → 主循环标志初始化 */
-  ap_adc_pending = 0;
 #if defined(IR_TEST_MODE)
   test_print_pending = 0;
   test_print_enabled = 0;   // 默认关闭, 通过 debug on 开启
@@ -191,31 +174,27 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+#if !defined(IR_TEST_MODE) /* 测试模式下不进行串口通信 使用命令行指令测试通信串口收发 */
     AP_UART_TxTask(); // 串口通信TX任务
     AP_UART_RxTask(); // 串口通信RX任务
+#endif /* IR_TEST_MODE */
 
     cmd_parser_task(); // 命令行解析
 
-    adc_sample_task(); // 消费 ap_adc_pending → AP_ADC_Update()
-
 #if defined(IR_TEST_MODE)
-    /* ================================================================ */
-    /*  测试模式: 100Hz 原始数据打印 (CLI: debug on/off, mark)          */
-    /* ================================================================ */
+    /* 测试模式: 仅 Feed ADC 填历史窗口, 不进状态机 */
+    AP_IR_Feed();
     if (test_print_pending && test_print_enabled) {
         test_print_pending = 0;
         test_print_data();
+        AP_IR_DebugProcess(HAL_GetTick());
     }
 #else
     /* ================================================================ */
     /*  正常模式: 紫外检测 + 红外检测 + 双重确认                          */
     /* ================================================================ */
-    AP_UV_Process(HAL_GetTick());
+    AP_UV_Task();
     AP_IR_Task();
-
-    if (AP_ADC_IsPrintPending()) {
-        AP_ADC_PrintDebug();
-    }
 
     /* 双重确认: UV && IR 同时触发 → 火警上报 */
     {
@@ -223,9 +202,11 @@ int main(void)
         uint8_t now_fire = (AP_UV_GetState() == UV_STATE_FIRE)
                         && (AP_IR_GetState() == IR_STATE_FIRE);
         if (now_fire && !last_fire) {
+            BSP_ALARM_Set();              // 硬件报警输出 (ALM1+ALM2 低)
             uint8_t data = 1;
             AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
         } else if (!now_fire && last_fire) {
+            BSP_ALARM_Reset();            // 硬件报警解除 (ALM1+ALM2 高)
             uint8_t data = 0;
             AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
         }
@@ -300,7 +281,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
 void task_10ms(void)
 {
-  ap_adc_pending = 1;     // 主循环消费, 执行 AP_ADC_Update()
   AP_IR_FeedIsr();        // 仅置位 volatile 标志 (极轻量)
 #if defined(IR_TEST_MODE)
   test_print_pending = 1; // 主循环消费, 执行 test_print_data()

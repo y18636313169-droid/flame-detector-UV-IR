@@ -45,6 +45,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "ap_util.h"        /* for IR_TEST_MODE */
 
 /* ========================================================================== */
 /*                          常量宏                                             */
@@ -54,10 +55,10 @@ extern "C" {
 #define IR_CH_NUM               (3U)        /* 3 通道(3.8/4.5/5.0 μm)      */
 #define IR_HISTORY_SIZE         (50U)       /* 50点 = 0.5s @100Hz          */
 
-/* 通道索引 (硬件映射: PC0/IN10, PC1/IN11, PC2/IN12) */
-#define IR_CH_REF_A             (0U)        /* 3.8μm 参考通道A(高温热源)    */
-#define IR_CH_MAIN              (1U)        /* 4.5μm 主信号通道(火焰特征)   */
-#define IR_CH_REF_B             (2U)        /* 5.0μm 参考通道B(背景辐射)    */
+/* 通道索引 (CubeMX 标签: IR_OUT_3/2/1) */
+#define IR_CH_REF_A             (0U)        /* 3.8μm — PC0/IN10 = IR_OUT_3 */
+#define IR_CH_MAIN              (1U)        /* 4.5μm — PC1/IN11 = IR_OUT_2 */
+#define IR_CH_REF_B             (2U)        /* 5.0μm — PC2/IN12 = IR_OUT_1 */
 
 /* ========================================================================== */
 /*                          状态枚举                                           */
@@ -86,6 +87,11 @@ void AP_IR_Init(void);
   *         由 TIM6 的 task_10ms() 每 10ms 调用一次
   */
 void AP_IR_FeedIsr(void);
+
+/**
+  * @brief  从 ADC 读最新值推入 50 点历史窗口（不进状态机）
+  */
+void AP_IR_Feed(void);
 
 /**
   * @brief  主循环中调用 — 检查标志→Feed→Process
@@ -129,6 +135,15 @@ void AP_IR_Reset(void);
 
 void AP_IR_GetFeatures(uint32_t power[3], float zcr[3],
                        uint32_t *r45_38, uint32_t *r45_50);
+#if defined(IR_TEST_MODE)
+/**
+  * @brief  测试模式: 执行完整信号处理链，打印中间结果，不进状态机
+  *         每 100Hz 调用一次，输出行格式:
+  *           T<ms> IRD DC=<c0>,<c1>,<c2> P=<p0>,<p1>,<p2> Z=<z0>,<z1>,<z2> R=<r38>,<r50>
+  * @param  now: HAL_GetTick()
+  */
+void AP_IR_DebugProcess(uint32_t now);
+#endif /* IR_TEST_MODE */
 
 #ifdef __cplusplus
 }

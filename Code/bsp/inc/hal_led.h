@@ -26,8 +26,8 @@ extern "C" {
 /* Exported defines ----------------------------------------------------------*/
 
 /** @brief  系统指示灯引脚（CubeMX 定义在 main.h 中） */
-#define BSP_LED_PIN         LED_Pin             /* GPIO_PIN_9      */
-#define BSP_LED_PORT        LED_GPIO_Port       /* GPIOC           */
+#define BSP_LED_PIN         LED_Pin             /* PC6      */
+#define BSP_LED_PORT        LED_GPIO_Port       /* GPIOC    */
 #define BSP_LED_ON_LEVEL    GPIO_PIN_RESET      /* 低电平点亮      */
 #define BSP_LED_OFF_LEVEL   GPIO_PIN_SET        /* 高电平熄灭      */
 

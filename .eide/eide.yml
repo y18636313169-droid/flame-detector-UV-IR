@@ -72,6 +72,7 @@ virtualFolder:
             - path: Code/bsp/src/ring_buffer.c
             - path: Code/bsp/src/hal_iwdg.c
             - path: Code/bsp/src/hal_eeprom.c
+            - path: Code/bsp/src/hal_alarm.c
           folders: []
         - name: ap
           files:

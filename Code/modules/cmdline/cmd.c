@@ -4,10 +4,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "hal_uart.h"
+#include "hal_led.h"
+#include "ap_adc.h"
 #include "ap_eeprom.h"
 #include "ap_uv.h"
 #include "ap_ir.h"
 #include "main.h"
+#include "ap_util.h"
 
 /* ========================================================================== */
 /*                          命令宏定义                                         */
@@ -42,6 +45,10 @@ static void cmd_state(int argc, char **argv);
 static void cmd_reset(int argc, char **argv);
 static void cmd_debug(int argc, char **argv);
 static void cmd_mark(int argc, char **argv);
+static void cmd_led(int argc, char **argv);
+#if defined(IR_TEST_MODE)
+static void cmd_uart(int argc, char **argv);
+#endif
 static void cmd_unknown(int argc, char **argv);
 
 /* ========================================================================== */
@@ -63,6 +70,11 @@ static const cmd_entry_t cmd_table[] = {
     {"reset",  cmd_reset},
     {"debug",  cmd_debug},
     {"mark",   cmd_mark},
+    {"led",    cmd_led},
+#if defined(IR_TEST_MODE)
+    {"uart",   cmd_uart},
+#endif /* IR_TEST_MODE */
+
     {NULL,     cmd_unknown},
 };
 
@@ -74,7 +86,7 @@ static void process_cmd_line(const char *line)
 {
     char *argv[CMD_MAX_ARGC];
     int argc = 0;
-    static char cmd_copy[CMD_BUF_SIZE];
+    char cmd_copy[CMD_BUF_SIZE];
 
     strncpy(cmd_copy, line, sizeof(cmd_copy));
     cmd_copy[sizeof(cmd_copy) - 1] = '\0';
@@ -146,6 +158,13 @@ static void cmd_help(int argc, char **argv)
     CMD_PRINTF("  reset                    — software reset MCU\r\n");
     CMD_PRINTF("  debug <on/off>           — toggle 100Hz test data print\r\n");
     CMD_PRINTF("  mark [text]              — insert scenario marker with optional text\r\n");
+    CMD_PRINTF("  led work <ms>            — set LED heartbeat interval\r\n");
+    CMD_PRINTF("  led blink <n> <ms>       — LED blink N times at interval\r\n");
+    CMD_PRINTF("  led stop                 — stop LED, turn off\r\n");
+#if defined(IR_TEST_MODE)
+    CMD_PRINTF("  uart loop <n>            — COM loopback test, send N bytes\r\n");
+    CMD_PRINTF("  uart recv                — print received COM data on DBG\r\n");
+#endif
 }
 
 /* ========================================================================== */
@@ -579,6 +598,79 @@ static void cmd_mark(int argc, char **argv)
 #endif
 }
 
+/* ========================================================================== */
+/*                         led — LED 控制                                      */
+/* ========================================================================== */
+
+static void cmd_led(int argc, char **argv)
+{
+    if (argc < 2) {
+        CMD_PRINTF("Usage: led work <ms> | blink <n> <ms> | stop\r\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "work") == 0 && argc > 2) {
+        uint32_t ms = strtoul(argv[2], NULL, 0);
+        if (ms < 10) ms = 10;
+        BSP_LED_Work(ms);
+        CMD_PRINTF("LED work interval=%lums\r\n", (unsigned long)ms);
+    } else if (strcmp(argv[1], "blink") == 0 && argc > 3) {
+        uint32_t n  = strtoul(argv[2], NULL, 0);
+        uint32_t ms = strtoul(argv[3], NULL, 0);
+        if (ms < 10) ms = 10;
+        if (n > 0) {
+            BSP_LED_Blink(n, ms);
+            CMD_PRINTF("LED blink %lu times, interval=%lums\r\n",
+                (unsigned long)n, (unsigned long)ms);
+        }
+    } else if (strcmp(argv[1], "stop") == 0) {
+        BSP_LED_Stop();
+        CMD_PRINTF("LED stopped\r\n");
+    } else {
+        CMD_PRINTF("Usage: led work <ms> | blink <n> <ms> | stop\r\n");
+    }
+}
+
+/* ========================================================================== */
+/*                         uart — 串口通信测试                                 */
+/* ========================================================================== */
+#if defined(IR_TEST_MODE)
+static void cmd_uart(int argc, char **argv)
+{
+    if (argc < 2) {
+        CMD_PRINTF("Usage: uart loop <n> | recv\r\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "loop") == 0) {
+        uint32_t n = (argc > 2) ? strtoul(argv[2], NULL, 0) : 16;
+        if (n > 128) n = 128;
+        uint8_t buf[128];
+        for (uint32_t i = 0; i < n; i++) buf[i] = (uint8_t)(i & 0xFF);
+        BSP_UART_Write(BSP_UART_COM, buf, (uint16_t)n);
+        BSP_UART_Printf("[UART] loopback %lu bytes sent on COM\r\n", (unsigned long)n);
+
+    } else if (strcmp(argv[1], "recv") == 0) {
+        uint8_t buf[64];
+        uint16_t len = BSP_UART_Read(BSP_UART_COM, buf, sizeof(buf));
+        if (len > 0) {
+            BSP_UART_Printf("[UART] COM recv %u bytes:\r\n  HEX: ", (unsigned)len);
+            for (uint16_t i = 0; i < len; i++) {
+                BSP_UART_Printf("%02X ", buf[i]);
+            }
+            BSP_UART_Printf("\r\n  ASC: ");
+            for (uint16_t i = 0; i < len; i++) {
+                BSP_UART_Printf("%c", (buf[i] >= 0x20 && buf[i] < 0x7F) ? buf[i] : '.');
+            }
+            BSP_UART_Printf("\r\n");
+        } else {
+            BSP_UART_Printf("[UART] COM no data\r\n");
+        }
+    } else {
+        CMD_PRINTF("Usage: uart loop <n> | recv\r\n");
+    }
+}
+#endif
 /* ========================================================================== */
 /*                         未知命令                                             */
 /* ========================================================================== */

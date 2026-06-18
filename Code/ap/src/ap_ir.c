@@ -28,6 +28,7 @@
 #include "ap_ir.h"
 #include "ap_adc.h"
 #include "ap_eeprom.h"
+#include "ap_util.h"
 #include "hal_uart.h"
 #include <string.h>
 #include <math.h>
@@ -44,16 +45,17 @@
 #endif
 
 /* ========================================================================== */
-/*                      IIR 低通滤波器系数                                     */
+/*                      IIR 低通滤波器系数 (Q15 定点)                          */
 /*         二阶 Butterworth Lowpass, fc=40Hz, fs=100Hz                        */
-/*         直接 I 型: y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2               */
+/*         直接 I 型: y = (b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2) >> 15       */
+/*         系数缩放: Q15 = round(coeff * 32768)                               */
 /* ========================================================================== */
 
-#define IIR_B0  0.6389f
-#define IIR_B1  1.2778f
-#define IIR_B2  0.6389f
-#define IIR_A1  (-1.1429f)    /* 注意: 差方程中是 -a1*y1, 此处 a1=1.1429 */
-#define IIR_A2  (-0.4129f)    /* 注意: 差方程中是 -a2*y2, 此处 a2=0.4129 */
+#define IIR_B0_Q15  6770    /*  0.2066 * 32768 */
+#define IIR_B1_Q15  13543   /*  0.4133 * 32768 */
+#define IIR_B2_Q15  6770    /*  0.2066 * 32768 */
+#define IIR_A1_Q15  (-12104) /* -0.3695 * 32768 (差方程中用 -a1*y1, 直接存 a1) */
+#define IIR_A2_Q15  6416    /*  0.1958 * 32768 */
 
 /* ========================================================================== */
 /*                         内部数据结构                                        */
@@ -137,16 +139,6 @@ static const char *ir_state_name(IR_DetectorState_t s)
 }
 
 /* ========================================================================== */
-/*                        内部辅助 — 线性插值                                  */
-/* ========================================================================== */
-
-static uint32_t lerp(uint32_t min, uint32_t max, uint32_t level)
-{
-    if (level >= IR_SENS_LEVELS) level = IR_SENS_LEVELS - 1;
-    return min + ((max - min) * level) / (IR_SENS_LEVELS - 1);
-}
-
-/* ========================================================================== */
 /*                     历史窗口操作                                            */
 /* ========================================================================== */
 
@@ -215,15 +207,15 @@ static void remove_dc(int32_t *buf, uint16_t len)
 */
 static void iir_lowpass_40hz(int32_t *buf, uint16_t len)
 {
-    float x1 = 0.0f, x2 = 0.0f;
-    float y1 = 0.0f, y2 = 0.0f;
+    int32_t x1 = 0, x2 = 0;
+    int32_t y1 = 0, y2 = 0;
 
     for (uint16_t i = 0; i < len; i++) {
-        float x0 = (float)buf[i];
-        float y0 = IIR_B0 * x0 + IIR_B1 * x1 + IIR_B2 * x2
-                   + IIR_A1 * y1 + IIR_A2 * y2;
+        int32_t x0 = buf[i];
+        int32_t y0 = (IIR_B0_Q15 * x0 + IIR_B1_Q15 * x1 + IIR_B2_Q15 * x2
+                       - IIR_A1_Q15 * y1 - IIR_A2_Q15 * y2) >> 15;
 
-        buf[i] = (int32_t)y0;
+        buf[i] = y0;
 
         x2 = x1; x1 = x0;
         y2 = y1; y1 = y0;
@@ -233,6 +225,23 @@ static void iir_lowpass_40hz(int32_t *buf, uint16_t len)
 /* ========================================================================== */
 /*                        特征提取函数                                         */
 /* ========================================================================== */
+
+#if defined(IR_TEST_MODE)
+/**
+  @brief  计算均值 (DC 偏置)
+  @param  buf: 原始信号 (int32_t)
+  @param  len: 数据点数
+  @return 均值 (int32_t)
+*/
+static int32_t calc_mean(const int32_t *buf, uint16_t len)
+{
+    int64_t sum = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        sum += buf[i];
+    }
+    return (int32_t)(sum / len);
+}
+#endif /* IR_TEST_MODE */
 
 /**
   @brief  计算平均功率 (均方值 ×1000)
@@ -333,9 +342,9 @@ static bool check_all_criteria(IR_Detector_t *d)
         float diff_a = (float)fabs((double)(zcr_main - zcr_refa));
         float diff_b = (float)fabs((double)(zcr_main - zcr_refb));
         if (diff_a > 5.0f || diff_b > 5.0f) {
-            DBG("WARN criterion-5: ZCR diff main-38=%.1fHz main-50=%.1fHz",
+            DBG("FAIL criterion-5: ZCR diff main-38=%.1fHz main-50=%.1fHz",
                 diff_a, diff_b);
-            /* 频率一致性不通过不直接否决, 仅降置信度 */
+            return false;
         }
     }
 
@@ -365,7 +374,7 @@ static void AP_IR_Process(uint32_t now)
     }
 
     /* ================================================================ */
-    /*  计算光谱比 (防除零)                                               */
+    /*  计算光谱比 (防除零) 大于0正常计算 否则输出9999                     */
     /* ================================================================ */
     {
         uint32_t p_refa = s_ir.feat[IR_CH_REF_A].power_x1000;
@@ -453,19 +462,22 @@ void AP_IR_FeedIsr(void)
 
 /* ========================================================================== */
 
-void AP_IR_Task(void)
+void AP_IR_Feed(void)
 {
     if (!s_ir.feed_pending) return;
     s_ir.feed_pending = 0;
 
-    /* ---- Feed: 读 3 通道最新 ADC 值推入历史窗口 ---- */
+    /* 读 3 通道最新 ADC 值推入历史窗口（不进状态机） */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
         uint16_t raw = AP_ADC_GetLatest(ch);
         history_push(ch, raw);
     }
+}
 
-    /* ---- Process: 执行检测算法 ---- */
-    AP_IR_Process(HAL_GetTick());
+void AP_IR_Task(void)
+{
+    AP_IR_Feed();                     /* Feed: 推入历史窗口     */
+    AP_IR_Process(HAL_GetTick());     /* Process: 全流程检测    */
 }
 
 /* ========================================================================== */
@@ -515,10 +527,10 @@ void AP_IR_SetLevel(uint8_t level)
     s_ir.level = (level >= IR_SENS_LEVELS) ? (IR_SENS_LEVELS - 1) : level;
     uint32_t lv = s_ir.level;
 
-    s_ir.power_thr_x1000  = (uint8_t)lerp(s_ir.pwr_min,    s_ir.pwr_max,   lv);
-    s_ir.ratio_38_thr_x1000 = (uint8_t)lerp(s_ir.r38_min,  s_ir.r38_max,   lv);
-    s_ir.ratio_50_thr_x1000 = (uint8_t)lerp(s_ir.r50_min,  s_ir.r50_max,   lv);
-    s_ir.confirm_ms        = lerp(s_ir.cfm_min, s_ir.cfm_max, lv);
+    s_ir.power_thr_x1000  = lerp_u32(s_ir.pwr_min,  s_ir.pwr_max,   lv, IR_SENS_LEVELS);
+    s_ir.ratio_38_thr_x1000 = lerp_u32(s_ir.r38_min, s_ir.r38_max,   lv, IR_SENS_LEVELS);
+    s_ir.ratio_50_thr_x1000 = lerp_u32(s_ir.r50_min, s_ir.r50_max,   lv, IR_SENS_LEVELS);
+    s_ir.confirm_ms        = lerp_u32(s_ir.cfm_min, s_ir.cfm_max, lv, IR_SENS_LEVELS);
 
     DBG("SetLevel %u: pwr=%lu r38=%lu r50=%lu cfm=%lu",
         s_ir.level,
@@ -573,3 +585,49 @@ void AP_IR_GetFeatures(uint32_t power[3], float zcr[3],
     if (r45_38) *r45_38 = s_ir.ratio_45_38_x1000;
     if (r45_50) *r45_50 = s_ir.ratio_45_50_x1000;
 }
+
+/* ========================================================================== */
+/*                    测试模式: 信号处理链调试打印                              */
+/* ========================================================================== */
+
+#if defined(IR_TEST_MODE)
+void AP_IR_DebugProcess(uint32_t now)
+{
+    /* 窗口未满 50 点 → 跳过 */
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        if (s_ir.history[ch].count < IR_HISTORY_SIZE) return;
+    }
+
+    int32_t work[IR_HISTORY_SIZE];
+    int32_t dc_offset[IR_CH_NUM];
+    uint32_t power[IR_CH_NUM];
+    float    zcr[IR_CH_NUM];
+
+    /* 逐通道: 线性化 → 算DC偏置 → 去直流 → IIR → 特征提取 */
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        uint8_t n = history_to_workbuf(&s_ir.history[ch], work);
+        if (n < IR_HISTORY_SIZE) return;
+
+        dc_offset[ch] = calc_mean(work, IR_HISTORY_SIZE);
+        remove_dc(work, IR_HISTORY_SIZE);
+        iir_lowpass_40hz(work, IR_HISTORY_SIZE);
+
+        power[ch] = calc_power_x1000(work, IR_HISTORY_SIZE);
+        zcr[ch]   = calc_zcr(work, IR_HISTORY_SIZE, 100.0f);
+    }
+
+    /* 光谱比 (防除零) 大于0正常计算 否则输出9999 */
+    uint32_t r45_38 = (power[IR_CH_REF_A] > 0)
+                    ? (power[IR_CH_MAIN] * 1000U / power[IR_CH_REF_A]) : 9999U;
+    uint32_t r45_50 = (power[IR_CH_REF_B] > 0)
+                    ? (power[IR_CH_MAIN] * 1000U / power[IR_CH_REF_B]) : 9999U;
+
+    /* 紧凑打印: T<ms> IRD DC=... P=... Z=... R=... */
+    BSP_UART_Printf("T%lu IRD DC=%ld,%ld,%ld P=%lu,%lu,%lu Z=%.1f,%.1f,%.1f R=%lu,%lu\r\n",
+        (unsigned long)now,
+        (long)dc_offset[0], (long)dc_offset[1], (long)dc_offset[2],
+        (unsigned long)power[0], (unsigned long)power[1], (unsigned long)power[2],
+        (double)zcr[0], (double)zcr[1], (double)zcr[2],
+        (unsigned long)r45_38, (unsigned long)r45_50);
+}
+#endif /* IR_TEST_MODE */

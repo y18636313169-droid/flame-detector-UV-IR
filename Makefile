@@ -80,15 +80,13 @@ Code/ap/src/ap_eeprom.c \
 Code/ap/src/ap_ir.c \
 Code/ap/src/ap_uart_protocol.c \
 Code/ap/src/ap_uv.c \
-Code/ap/src/app_uart_api.c \
-Code/ap/src/app_uart_api_evt.c \
-Code/ap/src/app_uart_api_sub.c \
+Code/bsp/src/hal_alarm.c \
 Code/modules/cmdline/cmd.c \
 Code/modules/crc/crc16.c
 
 # ASM sources
 ASM_SOURCES =  \
-startup_stm32l151xe.s
+Core/Src/startup_stm32l151xe.s
 
 # ASMM sources
 ASMM_SOURCES = 

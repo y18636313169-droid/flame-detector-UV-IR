@@ -392,5 +392,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     __HAL_UART_CLEAR_OREFLAG(huart);
 
     HAL_UART_DMAStop(huart);
+
+    /* 丢弃错误数据：读指针追上 DMA 写指针 */
+    ctrl->rx_rd_idx = rx_dma_wr_idx(ctrl);
+
     HAL_UART_Receive_DMA(huart, ctrl->rx_buf, BSP_UART_RX_BUF_SIZE);
 }

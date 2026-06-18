@@ -14,6 +14,7 @@
 
 #include "ap_uv.h"
 #include "ap_eeprom.h"
+#include "ap_util.h"
 #include "hal_tim.h"
 #include "hal_uart.h"
 #include <string.h>
@@ -42,8 +43,8 @@ typedef struct {
 
 typedef struct {
     UV_Pulse_t  history[MAX_HISTORY];
-    uint8_t     head;
-    uint8_t     count;
+    uint8_t     head;       /* 下一写入位置（环形写指针） */
+    uint8_t     count;      /* 有效元素个数 */
 
     uint8_t     level;              /* 当前等级 0~9 */
     uint32_t    window_ms;          /* 当前实际检测参数 */
@@ -129,9 +130,6 @@ void AP_UV_Feed(void)
 
 void AP_UV_Process(uint32_t now)
 {
-    /* ---- 从 BSP 读取新脉冲 ---- */
-    AP_UV_Feed();
-
     /* ---- 统计窗口内脉冲数 ---- */
     uint8_t pulse_cnt = 0;
     for (uint8_t i = 0; i < uv_det.count; i++) {
@@ -186,14 +184,10 @@ void AP_UV_Process(uint32_t now)
     }
 }
 
-/* ========================================================================== */
-/*                        内部辅助 — 线性插值                                  */
-/* ========================================================================== */
-
-static uint32_t lerp(uint32_t min, uint32_t max, uint32_t level)
+void AP_UV_Task(void)
 {
-    if (level >= UV_SENS_LEVELS) level = UV_SENS_LEVELS - 1;
-    return min + ((max - min) * level) / (UV_SENS_LEVELS - 1);
+    AP_UV_Feed();                   /* ---- 从 BSP 读取新脉冲 ---- */
+    AP_UV_Process(HAL_GetTick());   /* ---- 流程检测 ---- */
 }
 
 /* ========================================================================== */
@@ -233,10 +227,10 @@ void AP_UV_SetLevel(uint8_t level)
     uv_det.level = (level >= UV_SENS_LEVELS) ? (UV_SENS_LEVELS - 1) : level;
     uint32_t lv = uv_det.level;
 
-    uv_det.threshold  = (uint8_t)lerp(uv_det.thr_min, uv_det.thr_max, lv);
-    uv_det.window_ms  = lerp(uv_det.win_min, uv_det.win_max, lv);
-    uv_det.confirm_ms = lerp(uv_det.cfm_min, uv_det.cfm_max, lv);
-    uv_det.clear_ms   = lerp(uv_det.clr_min, uv_det.clr_max, lv);
+    uv_det.threshold  = (uint8_t)lerp_u32(uv_det.thr_min, uv_det.thr_max, lv, UV_SENS_LEVELS);
+    uv_det.window_ms  = lerp_u32(uv_det.win_min, uv_det.win_max, lv, UV_SENS_LEVELS);
+    uv_det.confirm_ms = lerp_u32(uv_det.cfm_min, uv_det.cfm_max, lv, UV_SENS_LEVELS);
+    uv_det.clear_ms   = lerp_u32(uv_det.clr_min, uv_det.clr_max, lv, UV_SENS_LEVELS);
 
     DBG("SetLevel %u: thr=%u win=%lu cfm=%lu clr=%lu",
         uv_det.level, uv_det.threshold, uv_det.window_ms,

@@ -49,19 +49,19 @@ static uint8_t           tx_buf[AP_UART_TX_BUF_SIZE];
 static volatile uint16_t tx_write;
 static volatile uint16_t tx_read;
 
-static AP_UART_TxState_t     tx_state = AP_UART_TX_IDLE;
-static uint8_t               tx_seq_counter;
-static uint16_t              tx_timeout_cnt;
-static volatile uint8_t      tx_ack_flag;       /* WAIT_ACK 中收到匹配 ACK */
+static volatile AP_UART_TxState_t  tx_state = AP_UART_TX_IDLE;
+static uint8_t                     tx_seq_counter;
+static volatile uint16_t           tx_timeout_cnt;
+static volatile uint8_t            tx_ack_flag;   /* WAIT_ACK 中收到匹配 ACK */
 
 typedef struct {
     uint8_t   fcode;
     uint8_t   data[AP_UART_DATA_MAX];
     uint16_t  data_len;
     uint8_t   seq;
-    uint8_t   retrans_cnt;
+    volatile uint8_t  retrans_cnt;   /* ISR 中递增 */
 } TxPending_t;
-static TxPending_t    tx_pending;
+static TxPending_t  tx_pending;
 
 static AP_UART_ParseStep_t rx_step = AP_UART_STEP_STX;
 static uint8_t  rx_frame[AP_UART_FRAME_MAX];
