@@ -11,7 +11,7 @@
 
 #include "hal_adc.h"
 #include "adc.h"
-#include "string.h"
+#include <string.h>
 /* Private variables ---------------------------------------------------------*/
 
 static uint16_t adc_dma_buf[BSP_ADC_NUM_CHANNELS];                 /* 3 通道 DMA 缓冲 */

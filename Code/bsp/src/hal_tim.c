@@ -70,10 +70,10 @@ static inline int is_valid_id(BSP_TIM_Id_t id)
     return (id >= 0 && id < BSP_TIM_NUM);
 }
 
-static inline BSP_TIM_Ctrl_t *get_ctrl(BSP_TIM_Id_t id)
-{
-    return &tim_ctrl[id];
-}
+//static inline BSP_TIM_Ctrl_t *get_ctrl(BSP_TIM_Id_t id)
+//{
+//    return &tim_ctrl[id];
+//}
 
 static BSP_TIM_Ctrl_t *find_ctrl_by_inst(TIM_TypeDef *inst)
 {

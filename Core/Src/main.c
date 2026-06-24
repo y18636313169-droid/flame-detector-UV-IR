@@ -81,21 +81,30 @@ void SystemClock_Config(void);
 #if defined(IR_TEST_MODE)
 
 /**
-  * @brief  测试模式: 打印 UV 脉冲原始数据
-  *         100Hz 紧凑格式, 每行 T<ms> 前缀
+  * @brief  测试模式: 打印 3 路 ADC 原始值 + UV 脉冲数据
+  *         100Hz 紧凑格式, 每行 T<ms> 前缀, 方便 PC 解析
   */
 static void test_print_data(void)
 {
     uint32_t tick = HAL_GetTick();
 
+    /* ADC 3 通道原始值 (直接从 DMA 缓冲读取) */
+    BSP_UART_Printf("T%lu ADC %u %u %u\r\n",
+        (unsigned long)tick,
+        AP_ADC_GetLatest(0), AP_ADC_GetLatest(1), AP_ADC_GetLatest(2));
+
     /* UV 脉冲: 脉宽列表 */
     BSP_TIM_PulseData_t pulses[20];
     uint16_t n = BSP_TIM_IC_ReadAllPulse(BSP_TIM_UV, pulses, 20);
-    BSP_UART_Printf("T%lu UV %u", (unsigned long)tick, (unsigned)n);
-    for (uint16_t i = 0; i < n; i++) {
-        BSP_UART_Printf(" %u", pulses[i].pulse_width_us);
+    /* 读到实际脉冲之后再打印 */
+    if (n > 0)
+    {
+      BSP_UART_Printf("T%lu UV %u", (unsigned long)tick, (unsigned)n);
+      for (uint16_t i = 0; i < n; i++) {
+          BSP_UART_Printf(" %u", pulses[i].pulse_width_us);
+      }
+      BSP_UART_Printf("\r\n");
     }
-    BSP_UART_Printf("\r\n");
 }
 
 static void test_print_marker(const char *msg)
@@ -182,12 +191,13 @@ int main(void)
     cmd_parser_task(); // 命令行解析
 
 #if defined(IR_TEST_MODE)
-    /* 测试模式: 仅 Feed ADC 填历史窗口, 不进状态机 */
-    AP_IR_Feed();
+    // /* 测试模式: 仅 Feed ADC 填历史窗口, 不进状态机 */
+    // AP_IR_Feed();
+/* 测试模式: 打印 3 路 ADC 原始值 + UV 脉冲数据 */
     if (test_print_pending && test_print_enabled) {
         test_print_pending = 0;
         test_print_data();
-        AP_IR_DebugProcess(HAL_GetTick());
+        // AP_IR_DebugProcess(HAL_GetTick());
     }
 #else
     /* ================================================================ */

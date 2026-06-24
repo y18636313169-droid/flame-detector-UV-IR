@@ -459,6 +459,7 @@ static void rx_get_param(uint8_t fcode, const uint8_t *data, uint16_t len,
                          uint8_t seq, AP_UART_Ack_t *ack)
 {
     (void)fcode;
+    (void)seq;
     if (len < 1) return;
     uint8_t  param_id = data[0];
     uint16_t value    = 0;                    /* TODO: 读取参数值 */
@@ -473,6 +474,7 @@ static void rx_set_param(uint8_t fcode, const uint8_t *data, uint16_t len,
                          uint8_t seq, AP_UART_Ack_t *ack)
 {
     (void)fcode;
+    (void)seq;
     if (len < 1) return;
     /* TODO: 写入参数 */
     ack->data[0]  = data[0];                  /* 参数 ID */

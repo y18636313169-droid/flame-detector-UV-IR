@@ -677,6 +677,7 @@ static void cmd_uart(int argc, char **argv)
 
 static void cmd_unknown(int argc, char **argv)
 {
+    (void)argc;
     CMD_PRINTF("Unknown command: %s\r\n", argv[0]);
     CMD_PRINTF("Type 'help' for available commands\r\n");
 }
