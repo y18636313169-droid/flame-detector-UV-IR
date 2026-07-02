@@ -40,7 +40,7 @@ static void uv_defaults(void *buf)
     AP_EEPROM_UV_Param_t *p = (AP_EEPROM_UV_Param_t *)buf;
     memset(p, 0, sizeof(*p));
     p->magic       = EEPROM_UV_MAGIC;
-    p->version     = 1;
+    p->version     = 2;
     p->length      = sizeof(AP_EEPROM_UV_Param_t);
     p->sensitivity = AP_EEPROM_UV_DEFAULT_SENS;
     p->thr_min     = AP_EEPROM_UV_DEFAULT_THR_MIN;
@@ -51,6 +51,9 @@ static void uv_defaults(void *buf)
     p->cfm_max     = AP_EEPROM_UV_DEFAULT_CFM_MAX;
     p->clr_min     = AP_EEPROM_UV_DEFAULT_CLR_MIN;
     p->clr_max     = AP_EEPROM_UV_DEFAULT_CLR_MAX;
+    p->pw_min_us   = AP_EEPROM_UV_DEFAULT_PW_MIN_US;
+    p->pw_max_us   = AP_EEPROM_UV_DEFAULT_PW_MAX_US;
+    p->print_window_ms = AP_EEPROM_UV_DEFAULT_PRINT_WIN_MS;
 }
 
 static void ir_defaults(void *buf)

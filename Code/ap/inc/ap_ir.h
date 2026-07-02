@@ -142,6 +142,20 @@ void AP_IR_GetFeatures(uint32_t power[3], float zcr[3],
   *           T<ms> IRD DC=<c0>,<c1>,<c2> P=<p0>,<p1>,<p2> Z=<z0>,<z1>,<z2> R=<r38>,<r50>
   * @param  now: HAL_GetTick()
   */
+/**
+  * @brief  测试模式: 读 ADC → 去直流 → 均方值，直接打印
+  *         不经 IIR/ZCR/光谱比/状态机
+  *         输出: T<ms> IRT DC=<d0>,<d1>,<d2> P=<p0>,<p1>,<p2>
+  * @param  now: HAL_GetTick()
+  */
+void AP_IR_TestPrint(uint32_t now);
+
+/**
+  * @brief  测试模式: 执行完整信号处理链，打印中间结果，不进状态机
+  *         每 100Hz 调用一次，输出行格式:
+  *           T<ms> IRD DC=<c0>,<c1>,<c2> P=<p0>,<p1>,<p2> Z=<z0>,<z1>,<z2> R=<r38>,<r50>
+  * @param  now: HAL_GetTick()
+  */
 void AP_IR_DebugProcess(uint32_t now);
 #endif /* IR_TEST_MODE */
 

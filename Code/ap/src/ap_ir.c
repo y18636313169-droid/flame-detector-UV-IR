@@ -256,8 +256,8 @@ static uint32_t calc_power_x1000(const int32_t *buf, uint16_t len)
         int64_t val = (int64_t)buf[i];
         sum_sq += val * val;
     }
-    /* sum_sq / len × 1000 = sum_sq * 1000 / len */
-    return (uint32_t)((sum_sq * 1000ULL) / len);
+    /* sum_sq / len × 1000 = sum_sq * 1000 / len     * 1000ULL*/
+    return (uint32_t)((sum_sq) / len / 50);
 }
 
 /**
@@ -587,6 +587,51 @@ void AP_IR_GetFeatures(uint32_t power[3], float zcr[3],
 }
 
 /* ========================================================================== */
+/**
+  * @brief  测试模式: 读 ADC → 去直流 → 均方值
+  *         不经 IIR/ZCR/光谱比/状态机
+  *         每 10ms 调用，输出格式: T<ms> IRT DC=<d0>,<d1>,<d2> P=<p0>,<p1>,<p2>
+  */
+void AP_IR_TestPrint(uint32_t now)
+{
+    /* Feed: 读 3 通道最新 ADC 值推入历史窗口 */
+    uint16_t raw[IR_CH_NUM] = {0};
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        raw[ch] = AP_ADC_GetLatest(ch);
+        history_push(ch, raw[ch]);
+    }
+
+    /* 窗口未满 50 点 → 跳过 */
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        if (s_ir.history[ch].count < IR_HISTORY_SIZE) return;
+    }
+
+    int32_t work[IR_HISTORY_SIZE];
+    int32_t dc[IR_CH_NUM];
+    uint32_t pwr[IR_CH_NUM];
+
+    /* 逐通道: 线性化 → DC偏置 → 去直流 → 均方值 */
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        memset(work, 0, sizeof(work));
+        uint8_t n = history_to_workbuf(&s_ir.history[ch], work);
+        if (n < IR_HISTORY_SIZE) return;
+
+        dc[ch] = calc_mean(work, IR_HISTORY_SIZE);
+        remove_dc(work, IR_HISTORY_SIZE);
+        pwr[ch] = calc_power_x1000(work, IR_HISTORY_SIZE);
+        if (pwr[ch] > 10000000UL) pwr[ch] = 0;
+    }
+    uint32_t r45_38 = (pwr[IR_CH_REF_A] > 0) 
+                  ? (pwr[IR_CH_MAIN] * 100UL) / pwr[IR_CH_REF_A] 
+                  : 0;
+    uint32_t r45_50 = (pwr[IR_CH_REF_B] > 0) 
+                  ? (pwr[IR_CH_MAIN] * 100UL) / pwr[IR_CH_REF_B] 
+                  : 0;
+
+    BSP_UART_Printf("%ld, %ld, %ld, %ld, %ld, %ld, %u, %u\r\n", (long)raw[0], (long)raw[1], (long)raw[2], 
+                        (unsigned long)pwr[0], (unsigned long)pwr[1], (unsigned long)pwr[2], r45_38, r45_50);
+}
+
 /*                    测试模式: 信号处理链调试打印                              */
 /* ========================================================================== */
 

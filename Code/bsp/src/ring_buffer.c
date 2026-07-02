@@ -191,7 +191,7 @@ uint8_t ring_buffer_overflowed(ring_buffer_t *rb)
 
     return flag;
 }
-/*
+
 uint16_t ring_buffer_tail(const ring_buffer_t *rb)
 {
     if (rb == NULL) return 0;
@@ -223,4 +223,4 @@ void ring_buffer_pop_commit(ring_buffer_t *rb)
         rb->tail++;
     }
     RB_CRIT_EXIT();
-}*/
+}

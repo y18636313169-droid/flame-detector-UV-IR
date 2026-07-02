@@ -62,6 +62,7 @@ typedef struct {
     uint32_t    warning_start_ms;
     uint32_t    fire_start_ms;
 
+    uint32_t    print_window_ms;    /* 测试打印窗口(ms) EEPROM 存储 */
     void        (*on_fire)(void);
 } UV_FlameDetector_t;
 
@@ -100,6 +101,10 @@ void AP_UV_Init(void (*on_fire)(void))
                      p->cfm_min, p->cfm_max,
                      p->clr_min, p->clr_max);
     AP_UV_SetLevel(uv_det.level);
+
+    /* 将 EEPROM 中配置的脉宽阈值写入 BSP */
+    BSP_TIM_IC_SetPulseRange((uint16_t)p->pw_min_us, (uint16_t)p->pw_max_us);
+    uv_det.print_window_ms = p->print_window_ms;
 }
 
 void AP_UV_Feed(void)
@@ -261,6 +266,17 @@ UV_DetectorState_t AP_UV_GetState(void)
     return uv_det.state;
 }
 
+void AP_UV_SetPrintWindow(uint32_t ms)
+{
+    if (ms < 100) ms = 100;  /* 最小 100ms */
+    uv_det.print_window_ms = ms;
+}
+
+uint32_t AP_UV_GetPrintWindow(void)
+{
+    return uv_det.print_window_ms;
+}
+
 void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
                      uint32_t *confirm_ms, uint32_t *clear_ms)
 {
@@ -269,3 +285,19 @@ void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
     if (confirm_ms) *confirm_ms = uv_det.confirm_ms;
     if (clear_ms)   *clear_ms   = uv_det.clear_ms;
 }
+
+#if defined(IR_TEST_MODE)
+void AP_UV_PrintData(uint32_t now)
+{
+    BSP_TIM_PulseData_t pulses[20];
+    uint16_t n = BSP_TIM_IC_ReadWindow(BSP_TIM_UV, now,
+                                        uv_det.print_window_ms, pulses, 20);
+    if (n > 0) {
+        BSP_UART_Printf("T%lu UV %u", (unsigned long)now, (unsigned)n);
+        for (uint16_t i = 0; i < n; i++) {
+            BSP_UART_Printf(" %u", pulses[i].pulse_width_us);
+        }
+        BSP_UART_Printf("\r\n");
+    }
+}
+#endif /* IR_TEST_MODE */

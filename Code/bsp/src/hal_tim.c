@@ -57,6 +57,10 @@ typedef struct {
 
 /* Private variables ---------------------------------------------------------*/
 
+/* 运行时脉宽过滤阈值（默认值由 EEPROM 覆盖） */
+static uint16_t s_pw_min_us = BSP_TIM_UV_PW_MIN_US_DEFAULT;
+static uint16_t s_pw_max_us = BSP_TIM_UV_PW_MAX_US_DEFAULT;
+
 static BSP_TIM_Ctrl_t tim_ctrl[BSP_TIM_NUM] = {
     [BSP_TIM_UV] = { .handle = NULL }
 };
@@ -113,8 +117,8 @@ void BSP_TIM_IC_CaptureHandler(TIM_HandleTypeDef *htim)
         pulse.timestamp_ms   = ctrl->rising_tick_ms;   /* 以上升沿时间为准 */
 
         /* 有效脉宽判定后入环形缓冲 */
-        if (pulse.pulse_width_us >= BSP_TIM_UV_PW_MIN_US &&
-            pulse.pulse_width_us <= BSP_TIM_UV_PW_MAX_US) {
+        if (pulse.pulse_width_us >= s_pw_min_us &&
+            pulse.pulse_width_us <= s_pw_max_us) {
             ring_buffer_push_overwrite(&ctrl->pulse_rb, &pulse);
         }
     }
@@ -248,6 +252,53 @@ int BSP_TIM_IC_ClearAllPulse(BSP_TIM_Id_t id)
 }
 
 /* ========================================================================== */
+
+void BSP_TIM_IC_SetPulseRange(uint16_t min_us, uint16_t max_us)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_pw_min_us = min_us;
+    s_pw_max_us = max_us;
+    __set_PRIMASK(primask);
+}
+
+uint16_t BSP_TIM_IC_ReadWindow(BSP_TIM_Id_t id, uint32_t now_ms,
+                                uint32_t window_ms, BSP_TIM_PulseData_t *pulses,
+                                uint16_t max)
+{
+    if (id >= BSP_TIM_NUM || pulses == NULL || max == 0) return 0;
+    BSP_TIM_Ctrl_t *ctrl = &tim_ctrl[id];
+    if (!ctrl->initialized) return 0;
+
+    ring_buffer_t *rb = &ctrl->pulse_rb;
+    uint16_t out_cnt = 0;
+
+    /* 第一步：pop 超时的脉冲 (timestamp_ms + window_ms < now_ms) */
+    while (1) {
+        BSP_TIM_PulseData_t *p = (BSP_TIM_PulseData_t *)ring_buffer_front(rb);
+        if (p == NULL) break;
+        if (p->timestamp_ms + window_ms < now_ms) {
+            ring_buffer_pop_commit(rb);  /* 超时，移除 */
+        } else {
+            break;  /* 遇到第一个未超时的就停止 */
+        }
+    }
+
+    /* 第二步：peek 窗口内的脉冲到输出数组（不移除） */
+    uint16_t total = ring_buffer_count(rb);
+    for (uint16_t i = 0; i < total && out_cnt < max; i++) {
+        BSP_TIM_PulseData_t pulse;
+        if (ring_buffer_peek(rb, &pulse, i) == 0) {
+            if (pulse.timestamp_ms + window_ms >= now_ms) {
+                pulses[out_cnt++] = pulse;
+            }
+        }
+    }
+
+    return out_cnt;
+}
+
+/* ========================================================================== */
 /*         旧单通道极性翻转捕获实现 — 保留注释以供后续参考                     */
 /* ========================================================================== */
 #if 0
@@ -293,8 +344,8 @@ void BSP_TIM_IC_CaptureHandler(TIM_HandleTypeDef *htim)
             BSP_TIM_PulseData_t pulse;
             pulse.pulse_width_us = TICKS_TO_US(total, ctrl->tick_us);
             pulse.timestamp_ms   = HAL_GetTick();
-            if (pulse.pulse_width_us >= BSP_TIM_UV_PW_MIN_US &&
-                 pulse.pulse_width_us <= BSP_TIM_UV_PW_MAX_US) {
+            if (pulse.pulse_width_us >= s_pw_min_us &&
+                 pulse.pulse_width_us <= s_pw_max_us) {
                 ring_buffer_push_overwrite(&ctrl->pulse_rb, &pulse);
             }
             TIM_IC_InitTypeDef ic_cfg;

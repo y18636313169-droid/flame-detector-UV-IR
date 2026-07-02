@@ -275,6 +275,6 @@ targets:
       OpenOCD:
         baseAddr: "0x08000000"
         bin: ""
-        interface: stlink-v2
+        interface: stlink
         target: stm32l1
     uploader: OpenOCD

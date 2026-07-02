@@ -51,12 +51,13 @@ extern "C" {
 #define BSP_TIM_BUSY        (-2)
 
 /**
-  * @brief  UV 脉冲有效判定门限
+  * @brief  UV 脉冲有效判定门限默认值
   *         C10807 典型脉宽 ~10ms，有效窗口 6~14ms
-  *         电焊/闪电干扰脉冲通常 <1ms
+  *         可通过 BSP_TIM_IC_SetPulseRange 运行时修改，
+  *         或通过 EEPROM 配置（参数重启后生效）。
   */
-#define BSP_TIM_UV_PW_MIN_US    (6000U)
-#define BSP_TIM_UV_PW_MAX_US    (14000U)
+#define BSP_TIM_UV_PW_MIN_US_DEFAULT    (6000U)
+#define BSP_TIM_UV_PW_MAX_US_DEFAULT    (14000U)
 
 /**
   * @brief  环形缓冲池大小（元素个数）
@@ -115,10 +116,33 @@ int  BSP_TIM_IC_ClearAllPulse(BSP_TIM_Id_t id);
   * @brief  批量读取所有脉冲数据（非阻塞）
   * @param  id:       TIM 端口 ID
   * @param  pulses:   输出数组
-  * @param  max:      数组最大容量
+  * @param  max:    数组最大容量
   * @retval 实际读取到的脉冲数量（0 = 缓冲空）
   */
 uint16_t BSP_TIM_IC_ReadAllPulse(BSP_TIM_Id_t id, BSP_TIM_PulseData_t *pulses, uint16_t max);
+
+/**
+  * @brief  设置脉冲宽度有效范围
+  *         ISR 将只把在此范围内的脉冲写入环形缓冲
+  * @param  min_us: 最小脉宽(µs)
+  * @param  max_us: 最大脉宽(µs)
+  */
+void BSP_TIM_IC_SetPulseRange(uint16_t min_us, uint16_t max_us);
+
+/**
+  * @brief  读取窗口内的脉冲（peek 不 pop）+ 清理超时脉冲
+  *         在 window_ms 范围内的脉冲拷贝到输出数组（不移除），
+  *         超过 window_ms 的脉冲从环形缓冲中移除。
+  * @param  id:        TIM 端口 ID
+  * @param  now_ms:    当前时间戳 (HAL_GetTick)
+  * @param  window_ms: 时间窗口(ms)
+  * @param  pulses:    输出数组
+  * @param  max:       数组最大容量
+  * @retval 窗口内脉冲数量（0 = 无有效脉冲）
+  */
+uint16_t BSP_TIM_IC_ReadWindow(BSP_TIM_Id_t id, uint32_t now_ms,
+                                uint32_t window_ms, BSP_TIM_PulseData_t *pulses,
+                                uint16_t max);
 
 
 /* ========================================================================== */

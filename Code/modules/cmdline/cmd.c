@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "hal_uart.h"
 #include "hal_led.h"
+#include "hal_tim.h"
 #include "ap_adc.h"
 #include "ap_eeprom.h"
 #include "ap_uv.h"
@@ -118,7 +119,7 @@ void cmd_parser_task(void)
 {
     uint8_t ch;
 
-    while (BSP_UART_Read(BSP_UART_COM, &ch, 1) == 1) {
+    while (BSP_UART_Read(BSP_UART_DBG, &ch, 1) == 1) {
         if (cmd_index + 1 >= CMD_END_LEN) {
             if (memcmp(&cmd_buf[cmd_index + 1 - CMD_END_LEN], CMD_END, CMD_END_LEN - 1) == 0 &&
                 ch == CMD_END[CMD_END_LEN - 1]) {
@@ -303,13 +304,17 @@ static void cmd_param_uv(int argc, char **argv)
         else if (strcmp(field, "cfm_min") == 0 && argc > 2) { p.cfm_min = strtoul(argv[2], NULL, 0); }
         else if (strcmp(field, "cfm_max") == 0 && argc > 2) { p.cfm_max = strtoul(argv[2], NULL, 0); }
         else if (strcmp(field, "clr_min") == 0 && argc > 2) { p.clr_min = strtoul(argv[2], NULL, 0); }
-        else if (strcmp(field, "clr_max") == 0 && argc > 2) { p.clr_max = strtoul(argv[2], NULL, 0); }
-        else { found = 0; }
+        else if (strcmp(field, "clr_max") == 0 && argc > 2) { p.clr_max   = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "pw_min") == 0 && argc > 2)       { p.pw_min_us = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "pw_max") == 0 && argc > 2)       { p.pw_max_us = strtoul(argv[2], NULL, 0); }
+        else if (strcmp(field, "print_win") == 0 && argc > 2)    { p.print_window_ms = strtoul(argv[2], NULL, 0); }else { found = 0; }
 
         if (found) {
             AP_UV_SetConfig(p.thr_min, p.thr_max, p.win_min, p.win_max,
                             p.cfm_min, p.cfm_max, p.clr_min, p.clr_max);
             AP_UV_SetLevel((uint8_t)p.sensitivity);
+            AP_UV_SetPrintWindow(p.print_window_ms);
+            BSP_TIM_IC_SetPulseRange((uint16_t)p.pw_min_us, (uint16_t)p.pw_max_us);
 
             if (AP_EEPROM_UV_Save(&p) == 0) {
                 CMD_PRINTF("%s saved (set level to re-calc)\r\n", field);
@@ -487,6 +492,26 @@ static void cmd_adc(int argc, char **argv)
         return;
     }
 
+    if (argc == 2)
+    {
+        uint32_t ch = (uint32_t)strtoul(argv[1], NULL, 0);
+        if (ch <= 2)
+        {
+            CMD_PRINTF("ADC%lu = %lu\r\n",
+                (unsigned long)ch, (unsigned long)AP_ADC_GetLatest(ch));
+        }
+        else
+        {
+            for (uint8_t i = 0; i <=2; i++)
+            {
+                CMD_PRINTF("ADC%lu = %lu ",
+                (unsigned long)i, (unsigned long)AP_ADC_GetLatest(i));
+            }
+            CMD_PRINTF("\r\n");
+        }
+        return;
+    }
+
     /* adc threshold <ch> <val> */
     if (argc == 4 && strcmp(argv[1], "threshold") == 0) {
         uint32_t ch = (uint32_t)strtoul(argv[2], NULL, 0);
@@ -647,12 +672,12 @@ static void cmd_uart(int argc, char **argv)
         if (n > 128) n = 128;
         uint8_t buf[128];
         for (uint32_t i = 0; i < n; i++) buf[i] = (uint8_t)(i & 0xFF);
-        BSP_UART_Write(BSP_UART_COM, buf, (uint16_t)n);
+        BSP_UART_Write(BSP_UART_DBG, buf, (uint16_t)n);
         BSP_UART_Printf("[UART] loopback %lu bytes sent on COM\r\n", (unsigned long)n);
 
     } else if (strcmp(argv[1], "recv") == 0) {
         uint8_t buf[64];
-        uint16_t len = BSP_UART_Read(BSP_UART_COM, buf, sizeof(buf));
+        uint16_t len = BSP_UART_Read(BSP_UART_DBG, buf, sizeof(buf));
         if (len > 0) {
             BSP_UART_Printf("[UART] COM recv %u bytes:\r\n  HEX: ", (unsigned)len);
             for (uint16_t i = 0; i < len; i++) {

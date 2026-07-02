@@ -141,24 +141,24 @@ void ring_buffer_clear(ring_buffer_t *rb);
   */
 uint8_t ring_buffer_overflowed(ring_buffer_t *rb);
 
-// /**
-//   * @brief  直接读取尾指针（用于零拷贝场景，与 ring_buffer_pop_direct 配合）
-//   */
-// uint16_t ring_buffer_tail(const ring_buffer_t *rb);
+/**
+  * @brief  直接读取尾指针（用于零拷贝场景，与 ring_buffer_pop_direct 配合）
+  */
+uint16_t ring_buffer_tail(const ring_buffer_t *rb);
 
-// /**
-//   * @brief  获取读指针位置的元素指针（零拷贝读，不移动读指针）
-//   * @param  rb: 控制块指针
-//   * @return 指向当前最旧元素的指针，空时返回 NULL
-//   * @note   此接口不涉及拷贝，适用于 ISR 中零拷贝消费。
-//   *         调用后必须配合 ring_buffer_pop_commit 推进读指针。
-//   */
-// void *ring_buffer_front(const ring_buffer_t *rb);
+/**
+  * @brief  获取读指针位置的元素指针（零拷贝读，不移动读指针）
+  * @param  rb: 控制块指针
+  * @return 指向当前最旧元素的指针，空时返回 NULL
+  * @note   此接口不涉及拷贝，适用于 ISR 中零拷贝消费。
+  *         调用后必须配合 ring_buffer_pop_commit 推进读指针。
+  */
+void *ring_buffer_front(const ring_buffer_t *rb);
 
-// /**
-//   * @brief  推进读指针（配合 ring_buffer_front 使用）
-//   */
-// void ring_buffer_pop_commit(ring_buffer_t *rb);
+/**
+  * @brief  推进读指针（配合 ring_buffer_front 使用）
+  */
+void ring_buffer_pop_commit(ring_buffer_t *rb);
 
 #ifdef __cplusplus
 }

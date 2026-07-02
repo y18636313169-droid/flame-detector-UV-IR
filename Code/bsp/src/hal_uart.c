@@ -1,14 +1,15 @@
 /**
   ******************************************************************************
   * @file    hal_uart.c
-  * @brief   BSP UART 抽象层 — DMA 环形缓冲驱动实现
+  * @brief   BSP UART 抽象层 — TX DMA + RX DMA CIRCULAR 环形缓冲驱动
+  *
+  *          TX (COM): 应用写入环形缓冲 → DMA 自动搬运。
+  *          TX (DBG): BSP_UART_Printf 直接轮询发送，不依赖 DMA。
+  *          RX: DMA CIRCULAR 模式持续填充 → 应用通过 Read/Peek/Consume 读取。
   *
   *          串口资源：
-  *            COM (USART1) — PA9/PA10, DMA1_CH4(TX)/CH5(RX) — CubeMX 管理
-  *            DBG (USART2) — PA2/PA3,  DMA1_CH7(TX)/CH6(RX) — CubeMX 管理
-  *
-  *          TX: 应用写入环形缓冲 → DMA 自动搬运。发送完成中断自动链式发送下一段。
-  *          RX: DMA 循环模式持续填充 → 应用通过 Read/Peek/Consume 读取。
+  *            DBG (USART1) — PA9/PA10, DMA1_CH4(TX)/CH5(RX)
+  *            COM (USART2) — PA2/PA3,  DMA1_CH7(TX)/CH6(RX)
   ******************************************************************************
   */
 
@@ -19,6 +20,7 @@
 #include <string.h>
 
 /* 引用 CubeMX 生成的 UART/DMA 句柄（定义在 usart.c） */
+extern UART_HandleTypeDef huart1;
 extern DMA_HandleTypeDef hdma_usart1_rx;
 extern DMA_HandleTypeDef hdma_usart1_tx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
@@ -56,8 +58,9 @@ typedef struct {
     uint16_t            tx_out;
     volatile bool       tx_busy;
 
+    /* RX DMA CIRCULAR 环形缓冲 */
     uint8_t             rx_buf[BSP_UART_RX_BUF_SIZE];
-    uint16_t            rx_rd_idx;
+    uint16_t            rx_rd_idx;          /* 应用读取位置 */
 
     uint8_t             initialized;
 } BSP_UART_Ctrl_t;
@@ -83,11 +86,10 @@ static inline BSP_UART_Ctrl_t *get_ctrl(BSP_UART_Id_t id)
 
 static inline uint16_t rx_dma_wr_idx(BSP_UART_Ctrl_t *ctrl)
 {
+    if (ctrl->hdma_rx == NULL) return 0;
     uint16_t ndtr = __HAL_DMA_GET_COUNTER(ctrl->hdma_rx);
     uint16_t pos  = BSP_UART_RX_BUF_SIZE - ndtr;
-    if (pos >= BSP_UART_RX_BUF_SIZE) {
-        pos = 0;
-    }
+    if (pos >= BSP_UART_RX_BUF_SIZE) pos = 0;
     return pos;
 }
 
@@ -135,7 +137,7 @@ int BSP_UART_Init(BSP_UART_Id_t id)
     BSP_UART_Ctrl_t *ctrl = get_ctrl(id);
     if (ctrl->initialized) return BSP_UART_OK;
 
-    if (id == BSP_UART_COM) {
+    if (id == BSP_UART_DBG) {
         ctrl->handle  = &huart1;
         ctrl->hdma_tx = &hdma_usart1_tx;
         ctrl->hdma_rx = &hdma_usart1_rx;
@@ -149,9 +151,9 @@ int BSP_UART_Init(BSP_UART_Id_t id)
         return BSP_UART_ERROR;
     }
 
-    ctrl->tx_in   = 0;
-    ctrl->tx_out  = 0;
-    ctrl->tx_busy = false;
+    ctrl->tx_in     = 0;
+    ctrl->tx_out    = 0;
+    ctrl->tx_busy   = false;
     ctrl->rx_rd_idx = 0;
 
     if (HAL_UART_Receive_DMA(ctrl->handle, ctrl->rx_buf, BSP_UART_RX_BUF_SIZE) != HAL_OK) {
@@ -324,20 +326,9 @@ void BSP_UART_ClearTxBuf(BSP_UART_Id_t id)
     __set_PRIMASK(primask);
 }
 
-uint8_t *BSP_UART_GetRxBuf(BSP_UART_Id_t id)
-{
-    if (!is_valid_id(id) || !get_ctrl(id)->initialized) return NULL;
-    return get_ctrl(id)->rx_buf;
-}
-
-uint16_t BSP_UART_GetRxRdPtr(BSP_UART_Id_t id)
-{
-    if (!is_valid_id(id) || !get_ctrl(id)->initialized) return 0;
-    return get_ctrl(id)->rx_rd_idx;
-}
-
 /* ========================================================================== */
-/*                      Printf                                                */
+/*                      Printf — DBG 串口轮询发送                             */
+/*          使用 HAL_UART_Transmit 阻塞发送，不依赖 DMA，防止 TX DMA 卡死     */
 /* ========================================================================== */
 
 int BSP_UART_Printf(const char *fmt, ...)
@@ -352,7 +343,8 @@ int BSP_UART_Printf(const char *fmt, ...)
 
     if (ret > 0) {
         uint16_t len = (ret >= (int)sizeof(buf)) ? (uint16_t)(sizeof(buf) - 1U) : (uint16_t)ret;
-        BSP_UART_WriteBlock(BSP_UART_DBG, (const uint8_t *)buf, len, 100);
+        /* 直接轮询发送 DBG 口（USART1），不依赖 DMA */
+        HAL_UART_Transmit(uart_ctrl[BSP_UART_DBG].handle, (uint8_t *)buf, len, HAL_MAX_DELAY);
     }
     return ret;
 }

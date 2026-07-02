@@ -1,7 +1,7 @@
 #MicroXplorer Configuration settings - do not modify
-ADC.Channel-0\#ChannelRegularConversion=ADC_CHANNEL_10
+ADC.Channel-0\#ChannelRegularConversion=ADC_CHANNEL_12
 ADC.Channel-1\#ChannelRegularConversion=ADC_CHANNEL_11
-ADC.Channel-2\#ChannelRegularConversion=ADC_CHANNEL_12
+ADC.Channel-2\#ChannelRegularConversion=ADC_CHANNEL_10
 ADC.ClockPrescaler=ADC_CLOCK_ASYNC_DIV4
 ADC.ContinuousConvMode=ENABLE
 ADC.DMAContinuousRequests=ENABLE

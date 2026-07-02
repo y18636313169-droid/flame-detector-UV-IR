@@ -49,11 +49,11 @@ typedef struct {
 /*                         2. UV 检测参数                                      */
 /* ========================================================================== */
 
-#define EEPROM_UV_MAGIC     0x45555656UL       /* "EUVV" */
+#define EEPROM_UV_MAGIC     0x45555632UL       /* "EUV2" — version 2 */
 
 typedef struct {
     uint32_t    magic;
-    uint32_t    version;
+    uint32_t    version;            /* 2 */
     uint32_t    length;
     uint32_t    sensitivity;        /* 当前等级 0~9 */
     uint32_t    thr_min;            /* threshold 等级0 */
@@ -64,6 +64,9 @@ typedef struct {
     uint32_t    cfm_max;            /* confirm 等级9 */
     uint32_t    clr_min;            /* clear 等级0 */
     uint32_t    clr_max;            /* clear 等级9 */
+    uint32_t    pw_min_us;          /* UV 最小脉宽(µs)  */
+    uint32_t    pw_max_us;          /* UV 最大脉宽(µs)  */
+    uint32_t    print_window_ms;    /* 测试打印窗口(ms)  */
     uint16_t    crc16;
     uint16_t    _pad;
 } AP_EEPROM_UV_Param_t;
@@ -117,6 +120,10 @@ typedef struct {
 #define AP_EEPROM_UV_DEFAULT_CFM_MAX   3500U
 #define AP_EEPROM_UV_DEFAULT_CLR_MIN   3000U
 #define AP_EEPROM_UV_DEFAULT_CLR_MAX   10000U
+
+#define AP_EEPROM_UV_DEFAULT_PW_MIN_US     6000U
+#define AP_EEPROM_UV_DEFAULT_PW_MAX_US     14000U
+#define AP_EEPROM_UV_DEFAULT_PRINT_WIN_MS  2000U
 
 /* IR 多光谱融合默认值 (中灵敏度, 对应文档Ⅱ级) */
 #define AP_EEPROM_IR_DEFAULT_SENS      5U
