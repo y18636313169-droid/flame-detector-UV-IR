@@ -257,7 +257,7 @@ static uint32_t calc_power_x1000(const int32_t *buf, uint16_t len)
         sum_sq += val * val;
     }
     /* sum_sq / len × 1000 = sum_sq * 1000 / len     * 1000ULL*/
-    return (uint32_t)((sum_sq) / len / 50);
+    return (uint32_t)((sum_sq) * 1 / len / 50);
 }
 
 /**
@@ -607,19 +607,28 @@ void AP_IR_TestPrint(uint32_t now)
     }
 
     int32_t work[IR_HISTORY_SIZE];
+    int32_t comp[IR_HISTORY_SIZE];
     int32_t dc[IR_CH_NUM];
     uint32_t pwr[IR_CH_NUM];
-
+    uint32_t pwr2[IR_CH_NUM];
+    uint8_t zcr[IR_CH_NUM];
     /* 逐通道: 线性化 → DC偏置 → 去直流 → 均方值 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
-        memset(work, 0, sizeof(work));
+        // memset(work, 0, sizeof(work));
         uint8_t n = history_to_workbuf(&s_ir.history[ch], work);
         if (n < IR_HISTORY_SIZE) return;
 
-        dc[ch] = calc_mean(work, IR_HISTORY_SIZE);
+        // dc[ch] = calc_mean(work, IR_HISTORY_SIZE);
         remove_dc(work, IR_HISTORY_SIZE);
+
+        memcpy(comp, work, sizeof(work));
+
+        zcr[ch] = (uint8_t)calc_zcr(work, IR_HISTORY_SIZE, 100.0f);
+        // iir_lowpass_40hz(work, IR_HISTORY_SIZE);
         pwr[ch] = calc_power_x1000(work, IR_HISTORY_SIZE);
+        // pwr2[ch] = calc_power_x1000(comp, IR_HISTORY_SIZE);
         if (pwr[ch] > 10000000UL) pwr[ch] = 0;
+        // if (pwr2[ch] > 10000000UL) pwr2[ch] = 0;
     }
     uint32_t r45_38 = (pwr[IR_CH_REF_A] > 0) 
                   ? (pwr[IR_CH_MAIN] * 100UL) / pwr[IR_CH_REF_A] 
@@ -627,9 +636,16 @@ void AP_IR_TestPrint(uint32_t now)
     uint32_t r45_50 = (pwr[IR_CH_REF_B] > 0) 
                   ? (pwr[IR_CH_MAIN] * 100UL) / pwr[IR_CH_REF_B] 
                   : 0;
-
-    BSP_UART_Printf("%ld, %ld, %ld, %ld, %ld, %ld, %u, %u\r\n", (long)raw[0], (long)raw[1], (long)raw[2], 
-                        (unsigned long)pwr[0], (unsigned long)pwr[1], (unsigned long)pwr[2], r45_38, r45_50);
+    // int32_t diff_sum = 0;
+    // for (int i = 0; i < IR_HISTORY_SIZE; i++) {
+    //     int32_t diff = (int64_t)comp[i] - (int64_t)work[i];
+    //     diff_sum += (diff > 0) ? diff : -diff;
+    // }
+    
+    BSP_UART_Printf("%ld, %ld, %ld, %ld, %ld, %ld, %d, %d, %d, %u, %u\r\n", (long)raw[0], (long)raw[1], (long)raw[2], 
+                        (unsigned long)pwr[0], (unsigned long)pwr[1], (unsigned long)pwr[2],
+                        // (unsigned long)pwr2[0], (unsigned long)pwr2[1], (unsigned long)pwr2[2], (long long)diff_sum,   %ld, %ld, %ld
+                        zcr[0], zcr[1], zcr[2], r45_38, r45_50);
 }
 
 /*                    测试模式: 信号处理链调试打印                              */

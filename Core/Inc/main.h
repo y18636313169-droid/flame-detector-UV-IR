@@ -55,8 +55,10 @@ void Error_Handler(void);
 /* USER CODE BEGIN EFP */
 
 #if defined(IR_TEST_MODE)
-void TEST_SetPrintEnabled(uint8_t en);
-uint8_t TEST_GetPrintEnabled(void);
+void TEST_SetIrEnabled(uint8_t en);
+uint8_t TEST_GetIrEnabled(void);
+void TEST_SetUvEnabled(uint8_t en);
+uint8_t TEST_GetUvEnabled(void);
 void TEST_InsertMarker(const char *msg);
 #endif
 

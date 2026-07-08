@@ -289,14 +289,14 @@ void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
 #if defined(IR_TEST_MODE)
 void AP_UV_PrintData(uint32_t now)
 {
-    BSP_TIM_PulseData_t pulses[20];
+    BSP_TIM_PulseData_t pulses[128];
     uint16_t n = BSP_TIM_IC_ReadWindow(BSP_TIM_UV, now,
-                                        uv_det.print_window_ms, pulses, 20);
+                                        uv_det.print_window_ms, pulses, 128);
     if (n > 0) {
         BSP_UART_Printf("T%lu UV %u", (unsigned long)now, (unsigned)n);
-        for (uint16_t i = 0; i < n; i++) {
-            BSP_UART_Printf(" %u", pulses[i].pulse_width_us);
-        }
+        // for (uint16_t i = 0; i < n; i++) {
+        //     BSP_UART_Printf(" %u", pulses[i].pulse_width_us);
+        // }
         BSP_UART_Printf("\r\n");
     }
 }

@@ -588,17 +588,37 @@ static void cmd_debug(int argc, char **argv)
 {
 #if defined(IR_TEST_MODE)
     if (argc < 2) {
-        CMD_PRINTF("debug=%s\r\n", TEST_GetPrintEnabled() ? "on" : "off");
+        CMD_PRINTF("debug ir=%s uv=%s\r\n",
+            TEST_GetIrEnabled() ? "on" : "off",
+            TEST_GetUvEnabled() ? "on" : "off");
         return;
     }
-    if (strcmp(argv[1], "on") == 0) {
-        TEST_SetPrintEnabled(1);
-        CMD_PRINTF("debug on\r\n");
-    } else if (strcmp(argv[1], "off") == 0) {
-        TEST_SetPrintEnabled(0);
-        CMD_PRINTF("debug off\r\n");
-    } else {
-        CMD_PRINTF("Usage: debug on|off\r\n");
+    if (argc == 2) {
+        if (strcmp(argv[1], "on") == 0) {
+            TEST_SetIrEnabled(1);
+            TEST_SetUvEnabled(1);
+            CMD_PRINTF("debug ir=on uv=on\r\n");
+        } else if (strcmp(argv[1], "off") == 0) {
+            TEST_SetIrEnabled(0);
+            TEST_SetUvEnabled(0);
+            CMD_PRINTF("debug ir=off uv=off\r\n");
+        } else {
+            CMD_PRINTF("Usage: debug [ir|uv] on|off\r\n");
+        }
+        return;
+    }
+    if (argc >= 3) {
+        if (strcmp(argv[1], "ir") == 0) {
+            uint8_t en = (strcmp(argv[2], "on") == 0) ? 1 : 0;
+            TEST_SetIrEnabled(en);
+            CMD_PRINTF("debug ir=%s\r\n", en ? "on" : "off");
+        } else if (strcmp(argv[1], "uv") == 0) {
+            uint8_t en = (strcmp(argv[2], "on") == 0) ? 1 : 0;
+            TEST_SetUvEnabled(en);
+            CMD_PRINTF("debug uv=%s\r\n", en ? "on" : "off");
+        } else {
+            CMD_PRINTF("Usage: debug [ir|uv] on|off\r\n");
+        }
     }
 #else
     (void)argc;

@@ -64,7 +64,8 @@
 /* ISR → 主循环标志 (ISR 只置位, 主循环消费) */
 #if defined(IR_TEST_MODE)
 static volatile uint8_t  test_print_pending;    /* 10ms 测试打印标志 */
-static uint8_t           test_print_enabled;    /* CLI on/off 控制 */
+static uint8_t           ir_print_enabled;      /* IR ADC 打印开关 */
+static uint8_t           uv_print_enabled;      /* UV 脉冲打印开关 */
 #endif
 
 /* USER CODE END PV */
@@ -99,8 +100,11 @@ static void test_print_marker(const char *msg)
 }
 
 /* ---- 对外接口 (供 cmd.c 调用) ---- */
-void TEST_SetPrintEnabled(uint8_t en) { test_print_enabled = en; }
-uint8_t TEST_GetPrintEnabled(void) { return test_print_enabled; }
+void TEST_SetIrEnabled(uint8_t en) { ir_print_enabled = en; }
+uint8_t TEST_GetIrEnabled(void) { return ir_print_enabled; }
+void TEST_SetUvEnabled(uint8_t en) { uv_print_enabled = en; }
+uint8_t TEST_GetUvEnabled(void) { return uv_print_enabled; }
+
 void TEST_InsertMarker(const char *msg) { test_print_marker(msg); }
 
 #endif /* IR_TEST_MODE */
@@ -156,7 +160,8 @@ int main(void)
   /* ISR → 主循环标志初始化 */
 #if defined(IR_TEST_MODE)
   test_print_pending = 0;
-  test_print_enabled = 0;   // 默认关闭, 通过 debug on 开启
+  ir_print_enabled = 0;
+  uv_print_enabled = 0;   /* 默认关闭 */
   BSP_UART_Printf("[TEST] IR_TEST_MODE enabled — type 'debug on' to start\r\n");
 #endif
   /* USER CODE END 2 */
@@ -173,19 +178,19 @@ int main(void)
         cmd_parser_task(); // 命令行解析
 
 #if defined(IR_TEST_MODE)
-    /* 测试模式: 仅 Feed ADC 填历史窗口, 不进状态机 */
-        AP_IR_Feed();
-    /* ADC 10ms + UV 0.5s */
-    if (test_print_pending && test_print_enabled) {
+    /* 测试模式: IR 打印由 test_print_pending 触发 */
+    if (test_print_pending) {
         test_print_pending = 0;
-        test_print_data();
-        {
-            // static uint32_t uv_cnt = 0;
-            // uv_cnt++;
-            // if (uv_cnt >= 50) {
-            //     uv_cnt = 0;
-            //     AP_UV_PrintData(HAL_GetTick());
-            // }
+        if (ir_print_enabled) {
+            test_print_data();
+        }
+        if (uv_print_enabled) {
+            static uint32_t uv_cnt = 0;
+            uv_cnt++;
+            if (uv_cnt >= 50) {
+                uv_cnt = 0;
+                AP_UV_PrintData(HAL_GetTick());
+            }
         }
     }
 #else
