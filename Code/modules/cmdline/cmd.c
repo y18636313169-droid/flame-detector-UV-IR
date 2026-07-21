@@ -157,7 +157,8 @@ static void cmd_help(int argc, char **argv)
     CMD_PRINTF("  ir                       — print IR state & features\r\n");
     CMD_PRINTF("  state                    — print system state\r\n");
     CMD_PRINTF("  reset                    — software reset MCU\r\n");
-    CMD_PRINTF("  debug <on/off>           — toggle 100Hz test data print\r\n");
+    CMD_PRINTF("  debug <on/off>           — toggle test data print\r\n");
+    CMD_PRINTF("  debug ir win <sec>       — set IR energy average window\r\n");
     CMD_PRINTF("  mark [text]              — insert scenario marker with optional text\r\n");
     CMD_PRINTF("  led work <ms>            — set LED heartbeat interval\r\n");
     CMD_PRINTF("  led blink <n> <ms>       — LED blink N times at interval\r\n");
@@ -588,13 +589,15 @@ static void cmd_debug(int argc, char **argv)
 {
 #if defined(IR_TEST_MODE)
     if (argc < 2) {
-        CMD_PRINTF("debug ir=%s uv=%s\r\n",
+        CMD_PRINTF("debug ir=%s uv=%s ir_win=%lums\r\n",
             TEST_GetIrEnabled() ? "on" : "off",
-            TEST_GetUvEnabled() ? "on" : "off");
+            TEST_GetUvEnabled() ? "on" : "off",
+            (unsigned long)AP_IR_TestGetAvgWindowMs());
         return;
     }
     if (argc == 2) {
         if (strcmp(argv[1], "on") == 0) {
+            AP_IR_TestSetAvgWindowMs(AP_IR_TestGetAvgWindowMs());
             TEST_SetIrEnabled(1);
             TEST_SetUvEnabled(1);
             CMD_PRINTF("debug ir=on uv=on\r\n");
@@ -609,7 +612,17 @@ static void cmd_debug(int argc, char **argv)
     }
     if (argc >= 3) {
         if (strcmp(argv[1], "ir") == 0) {
+            if (argc >= 4 && strcmp(argv[2], "win") == 0) {
+                uint32_t sec = strtoul(argv[3], NULL, 0);
+                AP_IR_TestSetAvgWindowMs(sec * 1000UL);
+                CMD_PRINTF("debug ir win=%lums\r\n",
+                    (unsigned long)AP_IR_TestGetAvgWindowMs());
+                return;
+            }
             uint8_t en = (strcmp(argv[2], "on") == 0) ? 1 : 0;
+            if (en) {
+                AP_IR_TestSetAvgWindowMs(AP_IR_TestGetAvgWindowMs());
+            }
             TEST_SetIrEnabled(en);
             CMD_PRINTF("debug ir=%s\r\n", en ? "on" : "off");
         } else if (strcmp(argv[1], "uv") == 0) {

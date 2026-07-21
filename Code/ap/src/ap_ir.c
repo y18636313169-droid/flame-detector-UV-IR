@@ -124,6 +124,86 @@ typedef struct {
 
 static IR_Detector_t s_ir;
 
+#if defined(IR_TEST_MODE)
+#define IR_TEST_AVG_WINDOW_MS_DEFAULT  (10000UL)
+#define IR_TEST_AVG_WINDOW_MS_MIN      (100UL)
+#define IR_TEST_AVG_WINDOW_MS_MAX      (60000UL)
+#define IR_TEST_SAMPLE_PERIOD_MS       (10UL)
+#define IR_TEST_WINDOW_MARK_VALUE      (4096UL)
+
+typedef struct {
+    uint64_t sum[IR_CH_NUM];
+    uint32_t samples;
+    uint32_t start_ms;
+    uint32_t window_ms;
+    uint32_t last_avg[IR_CH_NUM];
+    uint8_t  avg_valid;
+    uint8_t  marker_pending;
+} IR_TestStats_t;
+
+static IR_TestStats_t s_ir_test;
+
+static void test_stats_reset(uint32_t now)
+{
+    memset(s_ir_test.sum, 0, sizeof(s_ir_test.sum));
+    s_ir_test.samples = 0;
+    s_ir_test.start_ms = now;
+}
+
+static uint32_t test_stats_window_samples(void)
+{
+    uint32_t n = s_ir_test.window_ms / IR_TEST_SAMPLE_PERIOD_MS;
+    return (n == 0U) ? 1U : n;
+}
+
+static void test_stats_add(const uint32_t pwr[IR_CH_NUM])
+{
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        s_ir_test.sum[ch] += pwr[ch];
+    }
+    s_ir_test.samples++;
+
+    if (s_ir_test.samples >= test_stats_window_samples()) {
+        for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+            s_ir_test.last_avg[ch] = (uint32_t)(s_ir_test.sum[ch] / s_ir_test.samples);
+        }
+        s_ir_test.avg_valid = 1;
+        s_ir_test.marker_pending = 1;
+        test_stats_reset(HAL_GetTick());
+    }
+}
+
+static void test_stats_get_energy(uint32_t avg[IR_CH_NUM])
+{
+    if (s_ir_test.marker_pending) {
+        for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+            avg[ch] = IR_TEST_WINDOW_MARK_VALUE;
+        }
+        s_ir_test.marker_pending = 0;
+        return;
+    }
+
+    for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
+        avg[ch] = s_ir_test.avg_valid ? s_ir_test.last_avg[ch] : 0U;
+    }
+}
+
+void AP_IR_TestSetAvgWindowMs(uint32_t ms)
+{
+    if (ms < IR_TEST_AVG_WINDOW_MS_MIN) ms = IR_TEST_AVG_WINDOW_MS_MIN;
+    if (ms > IR_TEST_AVG_WINDOW_MS_MAX) ms = IR_TEST_AVG_WINDOW_MS_MAX;
+    s_ir_test.window_ms = ms;
+    s_ir_test.avg_valid = 0;
+    s_ir_test.marker_pending = 0;
+    test_stats_reset(HAL_GetTick());
+}
+
+uint32_t AP_IR_TestGetAvgWindowMs(void)
+{
+    return s_ir_test.window_ms;
+}
+#endif /* IR_TEST_MODE */
+
 /* ========================================================================== */
 /*                        内部辅助 — 状态名                                    */
 /* ========================================================================== */
@@ -436,6 +516,11 @@ static void AP_IR_Process(uint32_t now)
 void AP_IR_Init(void)
 {
     memset(&s_ir, 0, sizeof(s_ir));
+#if defined(IR_TEST_MODE)
+    memset(&s_ir_test, 0, sizeof(s_ir_test));
+    s_ir_test.window_ms = IR_TEST_AVG_WINDOW_MS_DEFAULT;
+    test_stats_reset(HAL_GetTick());
+#endif
     s_ir.state = IR_STATE_IDLE;
     s_ir.feed_pending = 0;
 
@@ -586,16 +671,17 @@ void AP_IR_GetFeatures(uint32_t power[3], float zcr[3],
     if (r45_50) *r45_50 = s_ir.ratio_45_50_x1000;
 }
 
+#if defined(IR_TEST_MODE)
 /* ========================================================================== */
 /**
   * @brief  测试模式: 读 ADC → 去直流 → 均方值
-  *         不经 IIR/ZCR/光谱比/状态机
-  *         每 10ms 调用，输出格式: T<ms> IRT DC=<d0>,<d1>,<d2> P=<p0>,<p1>,<p2>
+  *         按 window_ms 累计输出三路平均能量: E <avg0>,<avg1>,<avg2>
   */
 void AP_IR_TestPrint(uint32_t now)
 {
-    /* Feed: 读 3 通道最新 ADC 值推入历史窗口 */
+    (void)now;
     uint16_t raw[IR_CH_NUM] = {0};
+    /* Feed: 读 3 通道最新 ADC 值推入历史窗口 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
         raw[ch] = AP_ADC_GetLatest(ch);
         history_push(ch, raw[ch]);
@@ -607,51 +693,30 @@ void AP_IR_TestPrint(uint32_t now)
     }
 
     int32_t work[IR_HISTORY_SIZE];
-    int32_t comp[IR_HISTORY_SIZE];
-    int32_t dc[IR_CH_NUM];
     uint32_t pwr[IR_CH_NUM];
-    uint32_t pwr2[IR_CH_NUM];
-    uint8_t zcr[IR_CH_NUM];
     /* 逐通道: 线性化 → DC偏置 → 去直流 → 均方值 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
-        // memset(work, 0, sizeof(work));
         uint8_t n = history_to_workbuf(&s_ir.history[ch], work);
         if (n < IR_HISTORY_SIZE) return;
 
-        // dc[ch] = calc_mean(work, IR_HISTORY_SIZE);
         remove_dc(work, IR_HISTORY_SIZE);
 
-        memcpy(comp, work, sizeof(work));
-
-        zcr[ch] = (uint8_t)calc_zcr(work, IR_HISTORY_SIZE, 100.0f);
-        // iir_lowpass_40hz(work, IR_HISTORY_SIZE);
         pwr[ch] = calc_power_x1000(work, IR_HISTORY_SIZE);
-        // pwr2[ch] = calc_power_x1000(comp, IR_HISTORY_SIZE);
         if (pwr[ch] > 10000000UL) pwr[ch] = 0;
-        // if (pwr2[ch] > 10000000UL) pwr2[ch] = 0;
     }
-    uint32_t r45_38 = (pwr[IR_CH_REF_A] > 0) 
-                  ? (pwr[IR_CH_MAIN] * 100UL) / pwr[IR_CH_REF_A] 
-                  : 0;
-    uint32_t r45_50 = (pwr[IR_CH_REF_B] > 0) 
-                  ? (pwr[IR_CH_MAIN] * 100UL) / pwr[IR_CH_REF_B] 
-                  : 0;
-    // int32_t diff_sum = 0;
-    // for (int i = 0; i < IR_HISTORY_SIZE; i++) {
-    //     int32_t diff = (int64_t)comp[i] - (int64_t)work[i];
-    //     diff_sum += (diff > 0) ? diff : -diff;
-    // }
-    
-    BSP_UART_Printf("%ld, %ld, %ld, %ld, %ld, %ld, %d, %d, %d, %u, %u\r\n", (long)raw[0], (long)raw[1], (long)raw[2], 
-                        (unsigned long)pwr[0], (unsigned long)pwr[1], (unsigned long)pwr[2],
-                        // (unsigned long)pwr2[0], (unsigned long)pwr2[1], (unsigned long)pwr2[2], (long long)diff_sum,   %ld, %ld, %ld
-                        zcr[0], zcr[1], zcr[2], r45_38, r45_50);
+    test_stats_add(pwr);
+
+    uint32_t avg[IR_CH_NUM];
+    test_stats_get_energy(avg);
+    BSP_UART_Printf("%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+        (unsigned long)raw[0], (unsigned long)raw[1], (unsigned long)raw[2],
+        (unsigned long)pwr[0], (unsigned long)pwr[1], (unsigned long)pwr[2],
+        (unsigned long)avg[0], (unsigned long)avg[1], (unsigned long)avg[2]);
 }
 
 /*                    测试模式: 信号处理链调试打印                              */
 /* ========================================================================== */
 
-#if defined(IR_TEST_MODE)
 void AP_IR_DebugProcess(uint32_t now)
 {
     /* 窗口未满 50 点 → 跳过 */
