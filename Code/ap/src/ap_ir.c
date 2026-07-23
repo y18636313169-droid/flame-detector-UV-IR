@@ -147,11 +147,14 @@ typedef struct {
     ARMED  --P45首次达到ON---------------> OBSERVING
     OBSERVING --已进入WARNING且观察到期/FIRE就绪--> LIGHTER/SUSTAINED
     OBSERVING --从未进入WARNING且P45<OFF持续1秒--> ARMED
+    BYPASS --IR已进入WARNING/FIRE----------> SUSTAINED
     LIGHTER --有效能量持续恢复------------> SUSTAINED
     LIGHTER/SUSTAINED --P45<OFF持续2秒-----> BYPASS
     BYPASS --P45<OFF重新持续1秒------------> ARMED
 
   BYPASS表示尚未观察到完整的“安静背景->点火”过程，此时没有有效包络分类；
+  若设备面对已经燃烧且持续波动的火焰，P45可能无法连续低于OFF满1秒。此时正常
+  IR状态机一旦独立进入WARNING/FIRE，BYPASS按热启动直接接纳为SUSTAINED。
   LIGHTER是可恢复的干扰结论，后续出现持续真实火焰时只允许升级为SUSTAINED；
   SUSTAINED是本次火源的最终结论，禁止反向降级为LIGHTER。
   消退后必须先回BYPASS，再重新完成安静布防，下一次ON上穿沿才开始新分类。
@@ -1195,6 +1198,25 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
     IR_Profile_t *profile = &d->profile; /* 独立包络状态，不等同于IR报警状态 */
     uint32_t power = d->feat[IR_CH_MAIN].power_x1000; /* 当前P45：0.5秒滚动均方值 */
     uint32_t elapsed = now - profile->phase_start_ms; /* 当前阶段已运行时间，单位ms */
+
+    /*
+     * 热启动兜底：
+     * 设备上电时火焰可能已经存在，或旧事件释放后火焰仍在剧烈波动，此时P45无法
+     * 连续低于OFF满1秒，PROFILE会停留在BYPASS而得不到完整“安静->点火”包络。
+     * 只有正常IR五判据已经独立推动状态机进入WARNING/FIRE时，才将该事件接纳为
+     * SUSTAINED。该路径不修改valid_accum_ms，也不绕过五判据、确认时长或UV确认；
+     * 它仅补齐缺少冷启动沿时的包络状态，避免BYPASS长期悬空。
+     */
+    if (profile->state == IR_PROFILE_BYPASS &&
+        (d->state == IR_STATE_WARNING || d->state == IR_STATE_FIRE)) {
+        memset(profile, 0, sizeof(*profile));
+        profile->state = IR_PROFILE_SUSTAINED;
+        profile->phase_start_ms = now;
+        DBG("T%lu PROFILE BYPASS -> SUSTAINED REASON=HOT_START IR=%s P=%lu",
+            (unsigned long)now, ir_state_name(d->state),
+            (unsigned long)power);
+        return;
+    }
 
     if (profile->state == IR_PROFILE_ARMED) {
         /* 只认布防后的第一次ON上穿沿，该时刻作为3.5秒观察窗口的t=0。 */
