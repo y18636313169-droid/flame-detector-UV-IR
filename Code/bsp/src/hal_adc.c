@@ -11,10 +11,10 @@
 
 #include "hal_adc.h"
 #include "adc.h"
-#include <string.h>
 /* Private variables ---------------------------------------------------------*/
 
-static uint16_t adc_dma_buf[BSP_ADC_NUM_CHANNELS];                 /* 3 通道 DMA 缓冲 */
+/* DMA异步更新该数组，volatile防止CPU复用过期的寄存器缓存值。 */
+static volatile uint16_t adc_dma_buf[BSP_ADC_NUM_CHANNELS];
 static uint8_t  adc_dma_running = 0;
 static uint8_t  adc_initialized = 0;
 
@@ -31,8 +31,10 @@ int BSP_ADC_Init(void)
 int BSP_ADC_StartDMA(void)
 {
     if (!adc_initialized) return BSP_ADC_ERROR;
-    /* 清空 DMA 缓冲，防止上电后第一次读取未定义数据 */
-    memset(adc_dma_buf, 0, sizeof(adc_dma_buf));
+    /* volatile缓冲逐项清零，避免memset丢失DMA共享内存语义。 */
+    for (uint32_t ch = 0; ch < BSP_ADC_NUM_CHANNELS; ch++) {
+        adc_dma_buf[ch] = 0;
+    }
     if (HAL_ADC_Start_DMA(&hadc, (uint32_t *)adc_dma_buf, BSP_ADC_NUM_CHANNELS) != HAL_OK) {
         return BSP_ADC_ERROR;
     }

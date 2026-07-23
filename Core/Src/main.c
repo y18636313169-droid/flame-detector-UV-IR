@@ -163,6 +163,8 @@ int main(void)
   ir_print_enabled = 0;
   uv_print_enabled = 0;   /* 默认关闭 */
   BSP_UART_Printf("[TEST] IR_TEST_MODE enabled — type 'debug on' to start\r\n");
+#else
+  BSP_UART_Printf("NORMAL START!\r\n");
 #endif
   /* USER CODE END 2 */
 
@@ -171,11 +173,11 @@ int main(void)
   while (1)
   {
 #if !defined(IR_TEST_MODE) /* 测试模式下不进行串口通信 使用命令行指令测试通信串口收发 */
-    AP_UART_TxTask(); // 串口通信TX任务
-    AP_UART_RxTask(); // 串口通信RX任务
+    // AP_UART_TxTask(); // 串口通信TX任务
+    // AP_UART_RxTask(); // 串口通信RX任务
 #endif /* IR_TEST_MODE */
 
-        cmd_parser_task(); // 命令行解析
+    cmd_parser_task(); // 命令行解析
 
 #if defined(IR_TEST_MODE)
     /* 测试模式: IR 打印由 test_print_pending 触发 */
@@ -207,12 +209,25 @@ int main(void)
                         && (AP_IR_GetState() == IR_STATE_FIRE);
         if (now_fire && !last_fire) {
             BSP_ALARM_Set();              // 硬件报警输出 (ALM1+ALM2 低)
-            uint8_t data = 1;
-            AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
+            // uint8_t data = 1;
+            // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
+#if defined(AP_ALGO_DEBUG_ENABLE)
+            /* 仅记录最终组合报警沿，便于区分单传感器FIRE与实际输出报警。 */
+            BSP_UART_Printf("[ALARM] T%lu ON UV=%u IR=%u\r\n",
+                            (unsigned long)HAL_GetTick(),
+                            (unsigned int)AP_UV_GetState(),
+                            (unsigned int)AP_IR_GetState());
+#endif
         } else if (!now_fire && last_fire) {
             BSP_ALARM_Reset();            // 硬件报警解除 (ALM1+ALM2 高)
-            uint8_t data = 0;
-            AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
+            // uint8_t data = 0;
+            // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
+#if defined(AP_ALGO_DEBUG_ENABLE)
+            BSP_UART_Printf("[ALARM] T%lu OFF UV=%u IR=%u\r\n",
+                            (unsigned long)HAL_GetTick(),
+                            (unsigned int)AP_UV_GetState(),
+                            (unsigned int)AP_IR_GetState());
+#endif
         }
         last_fire = now_fire;
     }
@@ -303,7 +318,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
     if (htim->Instance == TIM6) {
         cnt_task ++;
-        AP_UART_CheckTimeout();
+        // AP_UART_CheckTimeout();
         if (cnt_task % 10 == 0)
         {
           task_10ms();

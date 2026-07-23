@@ -7,13 +7,13 @@
   *          决策火焰报警。
   *
   *          参数通过 min/max 范围 + 灵敏度等级线性插值计算：
-  *            level=0 → 使用各参数的 min 值
-  *            level=9 → 使用各参数的 max 值
+  *            level=0 → 使用各参数的 min 值，最灵敏
+  *            level=9 → 使用各参数的 max 值，最迟钝
   *            中间等级线性插值
   *
   *          == 使用示例 ==
-  *          AP_UV_Init(5, on_fire_alarm);
-  *          AP_UV_SetConfig(5,35, 1000,3500, 0,3500, 3000,10000);
+  *          AP_UV_Init(on_fire_alarm);
+  *          AP_UV_SetConfig(5,24, 1000,3500, 0,3500);
   *          AP_UV_SetLevel(5);  // 自动计算各参数
   *          while (1) {
   *              AP_UV_Process(HAL_GetTick());
@@ -35,7 +35,9 @@ extern "C" {
 /* ========================================================================== */
 
 #define UV_SENS_LEVELS          (10U)
-#define UV_MAX_HISTORY          (20U)
+#define UV_MAX_HISTORY          (64U)
+#define UV_DROP_OFF_PERCENT     (80U)    /* WARNING掉线下限占当前阈值的比例 */
+#define UV_DROPOUT_MS           (2000U)  /* 连续低于掉线下限的允许时间 */
 
 /* ========================================================================== */
 /*                          状态枚举                                           */
@@ -57,34 +59,26 @@ void AP_UV_Process(uint32_t now);
 void AP_UV_Task(void);
 
 /**
-  * @brief  设置 4 项检测参数的 min/max 范围（即等级 0 和等级 9 的值）
+  * @brief  设置 3 项检测参数的 min/max 范围（即等级 0 和等级 9 的值）
   *         供初始化或命令行修改 min/max 后调用。
   *         设置后需调用 AP_UV_SetLevel 才能生效。
   */
 void AP_UV_SetConfig(uint32_t thr_min, uint32_t thr_max,
                      uint32_t win_min, uint32_t win_max,
-                     uint32_t cfm_min, uint32_t cfm_max,
-                     uint32_t clr_min, uint32_t clr_max);
+                     uint32_t cfm_min, uint32_t cfm_max);
 
 /**
   * @brief  获取当前配置的 min/max 范围
   */
 void AP_UV_GetConfig(uint32_t *thr_min, uint32_t *thr_max,
                      uint32_t *win_min, uint32_t *win_max,
-                     uint32_t *cfm_min, uint32_t *cfm_max,
-                     uint32_t *clr_min, uint32_t *clr_max);
+                     uint32_t *cfm_min, uint32_t *cfm_max);
 
 /**
   * @brief  设置灵敏度等级并自动线性插值计算各检测参数
-  * @param  level: 0~9
+  * @param  level: 0~9，0最灵敏，9最迟钝
   */
 void AP_UV_SetLevel(uint8_t level);
-
-// /**
-//   * @brief  直接设置检测参数（跳过等级计算）
-//   */
-// void AP_UV_SetParams(uint32_t threshold, uint32_t window_ms,
-//                      uint32_t confirm_ms, uint32_t clear_ms);
 
 void AP_UV_SetPrintWindow(uint32_t ms);
 uint32_t AP_UV_GetPrintWindow(void);
@@ -105,7 +99,7 @@ UV_DetectorState_t AP_UV_GetState(void);
   * @brief  获取当前运行的检测参数
   */
 void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
-                     uint32_t *confirm_ms, uint32_t *clear_ms);
+                     uint32_t *confirm_ms, uint32_t *fire_timeout_ms);
 
 #ifdef __cplusplus
 }

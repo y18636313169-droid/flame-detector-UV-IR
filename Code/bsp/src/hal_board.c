@@ -34,7 +34,7 @@ int BSP_BoardInit(void)
     }
 
     /* 500ms闪烁灯 */
-    BSP_LED_Work(1000);
+    BSP_LED_Work(500);
     HAL_TIM_Base_Start_IT(&htim6);
     /* 报警输出初始化（MX_GPIO_Init 后立即执行，防止启动期间误触发） */
     BSP_ALARM_Init();

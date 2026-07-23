@@ -20,7 +20,11 @@ extern "C" {
 /*                          测试模式开关                                        */
 /* ========================================================================== */
 
-#define IR_TEST_MODE    /* 取消注释进入测试模式: 仅采集ADC+UV原始数据 */
+// #define IR_TEST_MODE     /* 取消注释进入测试模式: 仅采集ADC+UV原始数据 */
+#define AP_ALGO_DEBUG_ENABLE 1 /* 应用算法事件+500ms快照日志；关闭时不编译调试状态 */
+
+/* IR/UV共用：FIRE期间不做条件消警，仅在保持3分钟后自动清除。 */
+#define AP_FIRE_AUTO_CLEAR_MS  (3UL * 60UL * 1000UL)
 
 /* ========================================================================== */
 
@@ -36,8 +40,13 @@ extern "C" {
 static inline uint32_t lerp_u32(uint32_t min, uint32_t max,
                                 uint32_t level, uint32_t levels)
 {
+    if (levels <= 1U) return min;
     if (level >= levels) level = levels - 1;
-    return min + ((max - min) * level) / (levels - 1);
+    /* 64位乘法避免大参数插值溢出，同时兼容现场误配的降序端点。 */
+    if (max >= min) {
+        return min + (uint32_t)(((uint64_t)(max - min) * level) / (levels - 1U));
+    }
+    return min - (uint32_t)(((uint64_t)(min - max) * level) / (levels - 1U));
 }
 
 #ifdef __cplusplus

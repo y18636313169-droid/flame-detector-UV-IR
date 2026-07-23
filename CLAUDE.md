@@ -2,6 +2,7 @@
 
 永远使用中文回答；
 只修改必要的函数注释，每次修改不要把无关注释加来删去；
+修改算法、状态机、参数布局或并发逻辑时，必须在代码旁备注修改原因和关键约束，禁止无说明地修改逻辑；
 
 ## 目录结构
 
@@ -174,6 +175,7 @@ stm32l1xx_it.c
 |---------|------|
 | `lerp_u32(min, max, level, levels)` | 无符号 32 位线性插值（static inline） |
 | `IR_TEST_MODE` | 测试模式开关宏（定义在 ap_util.h） |
+| `AP_ALGO_DEBUG_ENABLE` | 应用模式算法事件及500ms特征快照开关（默认关闭，不编译调试状态） |
 
 ### ap_adc.h — ADC 原始值读取
 | 函数 | 说明 |
@@ -181,15 +183,15 @@ stm32l1xx_it.c
 | `AP_ADC_Init()` | 启动 ADC DMA 转换 |
 | `AP_ADC_GetLatest(ch)` | 读取指定通道最新原始值 |
 
-> 注：IR 算法直接通过 BSP_ADC_ReadValue 读取原始 DMA 值，不经过 AP_ADC 层。ap_adc 仅提供最简封装。
+> 注：IR 算法依次读取三通道最新 DMA 值，不使用 AP_ADC 滤波。
 
 ### ap_eeprom.h — EEPROM参数存储管理
 | 函数 | 说明 |
 |------|------|
 | `AP_EEPROM_Init()` | 加载所有参数组（ADC/UV/IR），魔数+CRC校验，失败写默认值 |
 | `AP_EEPROM_ADC_Get/Save/Reset` | ADC 阈值参数存取 |
-| `AP_EEPROM_UV_Get/Save/Reset` | UV 检测参数存取（灵敏度+4组min/max） |
-| `AP_EEPROM_IR_Get/Save/Reset` | IR 多光谱融合参数存取（灵敏度+4组min/max+2固定频率） |
+| `AP_EEPROM_UV_Get/Save/Reset` | UV 检测参数存取（v3：灵敏度+3组min/max+脉宽/打印窗口） |
+| `AP_EEPROM_IR_Get/Save/Reset` | IR 多光谱融合参数存取（v7：功率min/max+固定光谱比/频率/ZCR死区+确认时间min/max，兼容迁移v6） |
 
 ### ap_uart_protocol.h — 串口通信协议
 | 函数 | 说明 |
@@ -223,61 +225,78 @@ STEP_DATA: PeekPacket 整帧 → CRC 校验 → ETX 检查 → Consume → proce
 | `AP_UV_Feed()` | 从 BSP 读取脉冲加入历史队列 |
 | `AP_UV_Process(now)` | 窗口计数 → 状态机决策 |
 | `AP_UV_Task()` | Feed + Process 打包（主循环调用） |
-| `AP_UV_SetLevel(level)` | 运行时调整灵敏度 0~9 |
+| `AP_UV_SetLevel(level)` | 运行时调整灵敏度，0最灵敏、9最迟钝 |
 | `AP_UV_Process_Reset()` | 重置状态机到 IDLE |
 | `AP_UV_GetState()` | 返回当前状态 |
 
 #### 紫外状态机
 ```
-IDLE ──(窗口计数≥threshold)──→ WARNING ──(持续≥confirm_ms)──→ FIRE
-  ↑                             ↑ (掉线)                       │
-  └─────────────────────────────┘                               │
-                                                   (窗口=0 超 clear_ms)──┘
+IDLE ──(窗口计数≥threshold)──→ WARNING ──(有效累计≥confirm_ms)──→ FIRE
+  ↑                             │                                │
+  └──(低于80%阈值持续2秒)───────┘                                │
+                                                   (保持30分钟超时)──┘
 ```
-灵敏度 0~9 级线性插值：window_ms=3500~1000, threshold=35~5, confirm_ms=3500~0, clear_ms=10000~3000
+等级 0~9 按 min→max 线性插值：window_ms=1000~3500, threshold=5~32, confirm_ms=0~3500；**0最灵敏，9最迟钝**。WARNING进入后使用当前阈值80%的向上取整值作为掉线下限，低于下限时有效确认时间回退，连续2秒不足才退回IDLE；FIRE固定保持30分钟。
 
 ### ap_ir.h — 红外三波段多光谱融合火焰检测
 | 函数 | 说明 |
 |------|------|
 | `AP_IR_Init()` | 从EEPROM加载参数，初始化历史窗口和状态机 |
 | `AP_IR_FeedIsr()` | ISR(TIM6)调用，仅置位 volatile 标志 |
-| `AP_IR_Feed()` | 从 ADC 读最新值推入 50 点历史窗口（不进状态机） |
+| `AP_IR_Feed()` | 从 ADC 读最新值，经连续IIR后推入200点历史窗口（不进状态机） |
 | `AP_IR_Task()` | 主循环调用，检查标志→Feed→Process(全流程检测) |
-| `AP_IR_SetLevel(level)` | 运行时调整灵敏度 0~9，线性插值所有参数 |
+| `AP_IR_SetLevel(level)` | 运行时调整等级0~9，仅插值确认时长 |
 | `AP_IR_GetState()` | 返回当前状态 IR_STATE_IDLE/WARNING/FIRE |
 | `AP_IR_Reset()` | 重置状态机到 IDLE，清历史窗口 |
 | `AP_IR_GetFeatures(power, zcr, &r45_38, &r45_50)` | 获取实时特征值（调试用） |
-| `AP_IR_SetConfig(...)` | 设置 4+2 组参数 min/max 范围 |
+| `AP_IR_GetZcrDeadZone(dead_zone)` | 获取从EEPROM加载的三通道固定ZCR死区 |
+| `AP_IR_StartZcrCalibration()` | 启动非阻塞手动死区标定（预热5秒+5个独立2秒窗口） |
+| `AP_IR_CancelZcrCalibration()` | 取消手动标定，不改变当前死区和EEPROM |
+| `AP_IR_GetZcrCalibrationStatus(status)` | 查询标定阶段、窗口进度、剩余时间和生效死区 |
+| `AP_IR_SetConfig(...)` | 设置进场功率范围、固定光谱比/频率及确认时间范围 |
 | `AP_IR_GetParams(...)` | 获取当前运行参数 |
 | `AP_IR_DebugProcess(now)` | 测试模式：信号链处理+打印，不进状态机 |
 
 #### 算法流程
 ```
-Feed(ADC值→50点历史窗口) → 窗口满后:
-  线性化 → 去直流(减均值) → 40Hz IIR低通滤波(Q15定点)
-  → 平均功率(P3.8/P4.5/P5.0 ×1000)
-  → 过零率(ZCR3.8/ZCR4.5/ZCR5.0 Hz)
-  → 光谱比(R4.5/3.8, R4.5/5.0 ×1000)
+Feed(ADC值→每通道连续20Hz IIR→200点历史缓存) → ZCR窗口满后:
+  最近50点 → 去直流(减均值) → 平均功率(P3.8/P4.5/P5.0，均方值)
+  最近200点 → 独立去直流 → 使用EEPROM固定死区计算过零率(ZCR3.8/ZCR4.5/ZCR5.0 Hz)
+  → 光谱比(R4.5/3.8, R4.5/5.0 ×1000；参考功率仅在严格为0时比例置0)
   → 五判据串联:
-      ① P4.5 > 功率阈值
+      ① P4.5 ≥ 当前等级进场阈值12000~22000（退出阈值为当前值的40%）
       ② R4.5/3.8 > 光谱比阈值(高温热源鉴别)
       ③ R4.5/5.0 > 光谱比阈值(背景辐射鉴别)
-      ④ ZCR4.5 ∈ [1.5Hz, 20Hz] (闪烁频率验证)
-      ⑤ |ZCR4.5-ZCR3.8| < 5Hz (频率一致性)
-  → 全部通过: IDLE→WARNING→FIRE
+      ④ ZCR4.5 ∈ [1.0Hz, 20Hz] (闪烁频率验证)
+      ⑤ |ZCR4.5-ZCR3.8| < 2Hz 且 |ZCR4.5-ZCR5.0| < 2Hz (频率一致性)
+  → 五判据全部通过: IDLE→WARNING
+  → P45安静布防后第一次跨过当前等级ON时，并行启动3.5秒主通道包络分类
+      0~2.5秒: 持续记录0.5秒滚动均方值的启动最高峰early_peak
+      2.5~3.5秒: 独立统计衰减后late_mean及P45≥当前OFF占空比late_duty
+      WARNING证据先满足: FIRE迁移前立即使用已有数据提前完成分类
+      有后段样本且late/peak<40%: 本次点火沿分类为LIGHTER并阻止FIRE
+      其他情况或高灵敏度下后段数据不足: 分类为SUSTAINED并放行FIRE
+      两个终态都锁存到P45<当前OFF连续2秒，再回BYPASS重新安静1秒布防
+      WARNING掉线超时且PROFILE仍为OBS: 取消本次观察并回BYPASS
+      PROFILE不阻塞或清除WARNING证据积分，只在最终FIRE迁移点读取结论
 ```
 
 #### 状态机
 ```
-IDLE ──(五判据通过)──→ WARNING ──(持续≥confirm_ms)──→ FIRE
-  ↑                      ↑ (中断)                     │
-  └──────────────────────┘                            │
-                                          (等待外部复位)──┘
+IDLE ──(功率≥当前ON且五判据通过)──→ WARNING ──(积分满足且PROFILE非LIGHTER)──→ FIRE
+  ↑                                  │                                           │
+  └──(判据失败或功率<当前OFF持续2秒)─┘                       (保持超时)──────────┘
 ```
 
 #### 参数管理
-- **随灵敏度 0~9 插值**: 功率阈值(pwr)、光谱比(r38/r50)、确认时长(cfm) — 各带 min/max
-- **固定值(不插值)**: 频率下限(1.5Hz)、频率上限(20Hz) — 火焰频率与灵敏度无关
+- **随等级 0~9 插值**: 4.5um进场功率阈值(power=12000~22000)、确认时长(cfm)
+- **固定值(不插值)**: 光谱比阈值(r38/r50)、频率下限(1.0Hz)、频率上限(20Hz)
+- **固定ZCR死区**: 上电从EEPROM直接加载三通道死区，默认15/15/10，不使用启动阶段数据自动标定
+- **手动死区标定**: `ir cal start`后预热5秒，再采集5个互不重叠的2秒窗口；每窗口计算各通道P90(|AC|)，取5次中位数×1.5并限幅到10~30，保存EEPROM后立即生效
+- **功率抗抖**: ON按等级在12000~22000插值，OFF固定为当前ON的40%，两者仅约束4.5μm主通道；WARNING内主通道功率达到ON或处于OFF~ON迟滞区时有效积分每周期+10ms，功率低于OFF时每周期-10ms，连续2秒后退出WARNING
+- **点火包络分类**: BYPASS下P45低于当前OFF满1秒后进入ARMED；第一次跨过当前ON立即记录启动事件，使用0~2.5秒峰值及2.5~3.5秒后段均值分类。PROFILE和WARNING积分每10ms并行运行；若始终未进入WARNING且P45低于OFF满1秒，直接取消观察并回ARMED，不输出分类终态；若积分先达到confirm_ms，必须在FIRE迁移前使用已有数据提前收口。有后段样本且late/peak<40%时判为LIGHTER并阻止本次FIRE；后段数据不足按高灵敏度降级策略判为SUSTAINED放行，保证不因分类数据不足漏报。两个终态不在同一火源期间互相转换，P45连续低于当前OFF满2秒才回BYPASS，再安静1秒布防下一次点火沿；WARNING掉线超时时会取消尚未完成的OBS。PROFILE不暂停或清除WARNING积分
+- **频率锁存**: ZCR范围和三通道一致性只作为IDLE进入WARNING的门槛；WARNING不重复检查滚动ZCR，避免0.25Hz量化台阶清空确认进度
+- **EEPROM版本**: UV为v3；IR为v6，旧v5缺少固定死区，首次启动时自动恢复为v6默认值
 
 ### 串口协议帧格式
 
@@ -352,16 +371,16 @@ BSP_IWDG_CheckAndRefresh();   // 喂狗
 ADC 硬件 → DMA → adc_dma_buf[3] (BSP DMA1_CH1 CIRCULAR)
                     ↓
             AP_IR_Feed() / AP_IR_Feed()
-            → history_push() 到 50 点历史窗口 (3通道独立)
+            → 每通道连续 IIR → history_push() 到 200 点历史窗口
             → AP_IR_Process() / AP_IR_DebugProcess()
-            → 去除DC + IIR 40Hz Q15 定点滤波
+            → 最近50点提取DC/Power，最近200点提取ZCR
             → 特征提取(Power/ZCR/光谱比)
             → 五判据串联 → 状态机(IDLE→WARNING→FIRE)
             → 与 UV 状态逻辑与 → 最终火警
 
 TIM3 CH1/CH2 → 双通道捕获 (BSP)
-                    ↓ ISR: 硬件捕获→ring_buffer(20组)
-                    主循环: AP_UV_Task() → Feed → 历史队列
+                    ↓ ISR: 硬件捕获→ring_buffer(128组)
+                    主循环: AP_UV_Task() → Feed → AP历史队列(64组)
                     → 窗口计数 → 状态机(IDLE→WARNING→FIRE)
 
 AP_UART_Send → TX事件缓冲 → TxTask → 组帧→CRC→BSP_UART_Write→等ACK
@@ -376,10 +395,11 @@ TIM6 → AP_UART_CheckTimeout() + 置位标志(IR_feed_pending, test_print_pendi
 
 ## 测试模式 (IR_TEST_MODE)
 
-测试模式开关定义在 `Code/ap/inc/ap_util.h`，取消 `#define IR_TEST_MODE` 注释进入：
+测试模式开关定义在 `Code/ap/inc/ap_util.h`，取消 `IR_TEST_MODE` 宏定义行的注释即可进入：
 
 - **ISR 仅置标志**：`AP_IR_FeedIsr()` + `test_print_pending`
-- **主循环只跑**：命令行解析 + `AP_IR_Feed()`（仅推ADC填窗口，不进状态机）+ 条件打印 + 喂狗
+- **主循环只跑**：命令行解析 + 定时条件打印（`AP_IR_TestPrint()`内推ADC填窗口，不进状态机）+ 喂狗
+- **测试模式标定**：执行`ir cal start`后需保持IR打印开启，由100Hz测试采样推进标定
 - **不运行**：UV 状态机、IR 五判据算法、双重确认逻辑、串口通信协议(TxTask/RxTask)
 - **CLI 控制**：`debug on/off` 启停 100Hz 数据流打印
 - **场景分隔**：`mark [text]` 插入标记行
@@ -389,12 +409,18 @@ TIM6 → AP_UART_CheckTimeout() + 置位标志(IR_feed_pending, test_print_pendi
   每 100Hz 输出 2 行：
   ```
   T<ms> UV <n> <w1> <w2>...
-  T<ms> IRD DC=<d0>,<d1>,<d2> P=<p0>,<p1>,<p2> Z=<z0>,<z1>,<z2> R=<r38>,<r50>
+  T<ms> IRD DC=<d0>,<d1>,<d2> P=<p0>,<p1>,<p2> Z10=<z0>,<z1>,<z2> R1000=<r38>,<r50>
   ```
-  - DC: 原始 50 点窗口均值 (ADC 偏置)
-  - P: 平均功率 ×1000 (均方值缩放)
-  - Z: 过零率 (Hz)
-  - R: 光谱比 ×1000
+  - DC: 原始最近50点窗口均值 (ADC 偏置)
+  - P: 最近50点平均功率（去直流信号均方值）
+  - Z10: 最近200点过零率 ×10（整数15表示1.5Hz）
+  - R1000: 光谱比 ×1000（整数1500表示1.500；参考功率严格为0时为0）
+
+## 应用算法调试 (AP_ALGO_DEBUG_ENABLE)
+
+取消 `Code/ap/inc/ap_util.h` 中该宏的注释后，IR算法输出初始化参数、200点窗口就绪、每500ms特征快照、限频后的判据失败、功率掉线/恢复、点火包络分类、状态迁移及FIRE超时；UV算法输出每500ms窗口计数/覆盖统计和状态迁移；最终IR&&UV报警沿输出独立的`[ALARM]`日志。宏关闭时相关计时变量和日志函数不参与编译。
+
+手动标定时输出每个窗口的`[IR] ZCR_CAL window=<n>/5 P90=<...>`以及保存结果`[IR] ZCR_CAL saved DZ=<...>`；特征快照增加`PROF=BYPASS|ARMED|OBS|LIGHTER|SUSTAINED`。首次跨过当前等级ON输出`PROFILE onset P=<...> ON=<...>`；分类输出`PROFILE result=<...> PEAK=<...> LATE=<...> R1000=<...> DUTY1000=<...> OBS=<ms> MODE=FULL|FIRE_READY`，其中FIRE_READY保证分类早于FIRE；未进入WARNING且安静满1秒输出`PROFILE canceled ... REASON=NO_WARNING_QUIET ... -> ARMED`，WARNING超时取消则输出`REASON=WARNING_RESET -> BYPASS`；连续掉线2秒释放终态输出`PROFILE released ... -> BYPASS`。
 
 ## 项目进度
 
@@ -404,12 +430,12 @@ TIM6 → AP_UART_CheckTimeout() + 置位标志(IR_feed_pending, test_print_pendi
 | USART1/2 DMA | ✅ 完成 | COM+DBG 双串口，环形缓冲 |
 | TIM3 双通道脉宽捕获 | ✅ 完成 | CH1上升沿/CH2下降沿，16-bit回绕补偿 |
 | UV 紫外检测 | ✅ 完成 | 三级状态机，灵敏度0~9线性插值 |
-| IR 红外三波段检测 | ✅ 完成 | 多光谱融合 五判据串联 三级状态机，Q15定点IIR |
+| IR 红外三波段检测 | ✅ 完成 | 多光谱融合五判据、并行点火包络分类、三级状态机、Q15定点IIR |
 | EEPROM 参数存储 | ✅ 完成 | ADC/UV/IR 三扇区，魔数+CRC校验 |
 | IWDG 看门狗 | ✅ 完成 | ISR置标志→主循环喂狗模式 |
 | 串口协议 | ✅ 完成 | TX三态机+RX三步入解析，CRC16，ACK重传 |
 | 命令行框架 | ✅ 完成 | help/adc/uv/ir/param/state/reset/debug/mark/led/uart |
 | 硬件报警(ALM1/ALM2) | ✅ 完成 | BSP驱动，火警低电平输出 |
-| IR 信号链调试打印 | ✅ 完成 | DC偏置+Power×1000+ZCR+光谱比，不进状态机 |
+| IR 信号链调试打印 | ✅ 完成 | 测试模式打印DC/Power/ZCR/光谱比；应用模式打印限频特征快照和状态机事件 |
 | 双重确认(IR&&UV) | ✅ 完成 | 逻辑与→FIRE_ALARM上报+ALM硬件输出 |
 | 参数现场标定 | ⏳ 待定 | 需真实火焰数据标定阈值 |

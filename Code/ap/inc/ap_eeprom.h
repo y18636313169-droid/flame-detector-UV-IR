@@ -49,21 +49,20 @@ typedef struct {
 /*                         2. UV 检测参数                                      */
 /* ========================================================================== */
 
-#define EEPROM_UV_MAGIC     0x45555632UL       /* "EUV2" — version 2 */
+/* v3移除随等级变化的消警时间；旧v2魔数会在初始化时触发默认参数重建。 */
+#define EEPROM_UV_MAGIC     0x45555633UL       /* "EUV3" — version 3 */
 
 typedef struct {
     uint32_t    magic;
-    uint32_t    version;            /* 2 */
+    uint32_t    version;            /* 3 */
     uint32_t    length;
-    uint32_t    sensitivity;        /* 当前等级 0~9 */
+    uint32_t    sensitivity;        /* 当前等级：0最灵敏，9最迟钝 */
     uint32_t    thr_min;            /* threshold 等级0 */
     uint32_t    thr_max;            /* threshold 等级9 */
     uint32_t    win_min;            /* window 等级0 */
     uint32_t    win_max;            /* window 等级9 */
     uint32_t    cfm_min;            /* confirm 等级0 */
     uint32_t    cfm_max;            /* confirm 等级9 */
-    uint32_t    clr_min;            /* clear 等级0 */
-    uint32_t    clr_max;            /* clear 等级9 */
     uint32_t    pw_min_us;          /* UV 最小脉宽(µs)  */
     uint32_t    pw_max_us;          /* UV 最大脉宽(µs)  */
     uint32_t    print_window_ms;    /* 测试打印窗口(ms)  */
@@ -75,34 +74,37 @@ typedef struct {
 /*                         3. IR 检测参数 (多光谱融合算法)                     */
 /* ========================================================================== */
 
-#define EEPROM_IR_MAGIC     0x45495232UL       /* "EIR2" — version 2 */
+/*
+ * v7将4.5um进场功率由固定值改为等级0/9两个端点。
+ * ap_eeprom.c负责把有效v6参数迁移到v7，并保留现场标定的ZCR死区。
+ */
+#define EEPROM_IR_MAGIC     0x45495237UL       /* "EIR7" - version 7 */
 
 /**
   @brief  IR 多光谱融合检测参数
-          功率/光谱比/确认时长以 min/max 范围存储，灵敏度 0~9 级线性插值。
-          频率范围为固定值(火焰闪烁频率不随灵敏度变化)。
+          4.5um进场功率和确认时长以 min/max 范围存储，等级0~9线性插值。
+          光谱比阈值和频率范围为固定值，不随等级变化。
 
           缩放约定:
-            pwr_xxx = 平均功率均方值 ×1000  (e.g. 1500 = 1.500)
+            pwr_xxx = 去直流信号均方值
             r38/r50 = 光谱比 ×1000          (e.g. 1500 = 1.500)
             freq_xxx = 频率 ×10             (e.g. 15 = 1.5Hz)
             cfm = 确认时长 毫秒
 */
 typedef struct {
     uint32_t    magic;              /* EEPROM_IR_MAGIC       */
-    uint32_t    version;            /* 2                     */
+    uint32_t    version;            /* 7                     */
     uint32_t    length;             /* sizeof                 */
-    uint32_t    sensitivity;        /* 0~9                   */
-    uint32_t    pwr_min;            /* 功率阈值(×1000) 等级0   */
-    uint32_t    pwr_max;            /* 功率阈值(×1000) 等级9   */
-    uint32_t    r38_min;            /* R4.5/3.8(×1000) 等级0  */
-    uint32_t    r38_max;            /* R4.5/3.8(×1000) 等级9  */
-    uint32_t    r50_min;            /* R4.5/5.0(×1000) 等级0  */
-    uint32_t    r50_max;            /* R4.5/5.0(×1000) 等级9  */
+    uint32_t    sensitivity;        /* 0最灵敏，9最迟钝       */
+    uint32_t    power_min;          /* 4.5um进场阈值，等级0最灵敏 */
+    uint32_t    power_max;          /* 4.5um进场阈值，等级9最迟钝 */
+    uint32_t    r38_threshold;      /* R4.5/3.8(×1000) 固定   */
+    uint32_t    r50_threshold;      /* R4.5/5.0(×1000) 固定   */
     uint32_t    freq_low_x10;       /* 频率下限(×10)   固定  */
     uint32_t    freq_high_x10;      /* 频率上限(×10)   固定  */
     uint32_t    cfm_min;            /* 确认时长(ms)    等级0  */
     uint32_t    cfm_max;            /* 确认时长(ms)    等级9  */
+    uint32_t    zcr_dead_zone[3];    /* 3.8/4.5/5.0通道固定死区 */
     uint16_t    crc16;
     uint16_t    _pad;
 } AP_EEPROM_IR_Param_t;
@@ -113,30 +115,28 @@ typedef struct {
 
 #define AP_EEPROM_UV_DEFAULT_SENS      5U
 #define AP_EEPROM_UV_DEFAULT_THR_MIN   5U
-#define AP_EEPROM_UV_DEFAULT_THR_MAX   35U
+#define AP_EEPROM_UV_DEFAULT_THR_MAX   24U      /* 3.5秒火盆主分布下沿24；80%迟滞下限为20 */
 #define AP_EEPROM_UV_DEFAULT_WIN_MIN   1000U
 #define AP_EEPROM_UV_DEFAULT_WIN_MAX   3500U
 #define AP_EEPROM_UV_DEFAULT_CFM_MIN   0U
 #define AP_EEPROM_UV_DEFAULT_CFM_MAX   3500U
-#define AP_EEPROM_UV_DEFAULT_CLR_MIN   3000U
-#define AP_EEPROM_UV_DEFAULT_CLR_MAX   10000U
-
 #define AP_EEPROM_UV_DEFAULT_PW_MIN_US     6000U
 #define AP_EEPROM_UV_DEFAULT_PW_MAX_US     14000U
 #define AP_EEPROM_UV_DEFAULT_PRINT_WIN_MS  2000U
 
 /* IR 多光谱融合默认值 (中灵敏度, 对应文档Ⅱ级) */
 #define AP_EEPROM_IR_DEFAULT_SENS      5U
-#define AP_EEPROM_IR_DEFAULT_PWR_MIN   800U     /* 0.8  ×1000 */
-#define AP_EEPROM_IR_DEFAULT_PWR_MAX   4000U    /* 4.0  ×1000 */
-#define AP_EEPROM_IR_DEFAULT_R38_MIN   1000U    /* 1.0  ×1000 */
-#define AP_EEPROM_IR_DEFAULT_R38_MAX   2000U    /* 2.0  ×1000 */
-#define AP_EEPROM_IR_DEFAULT_R50_MIN   800U     /* 0.8  ×1000 */
-#define AP_EEPROM_IR_DEFAULT_R50_MAX   1800U    /* 1.8  ×1000 */
-#define AP_EEPROM_IR_DEFAULT_FREQ_LOW  15U      /* 1.5Hz ×10 (固定) */
+#define AP_EEPROM_IR_DEFAULT_POWER_MIN 12000U   /* 等级0：兼顾远距离弱火与背景裕量 */
+#define AP_EEPROM_IR_DEFAULT_POWER_MAX 22000U   /* 等级9：不超过实测弱火22600峰值 */
+#define AP_EEPROM_IR_DEFAULT_R38       1500U    /* 1.5  ×1000，固定 */
+#define AP_EEPROM_IR_DEFAULT_R50       1300U    /* 1.3  ×1000，固定 */
+#define AP_EEPROM_IR_DEFAULT_FREQ_LOW  10U      /* 1.0Hz ×10 (固定) */
 #define AP_EEPROM_IR_DEFAULT_FREQ_HIGH 200U     /* 20Hz ×10 (固定) */
 #define AP_EEPROM_IR_DEFAULT_CFM_MIN   200U     /* 200ms */
 #define AP_EEPROM_IR_DEFAULT_CFM_MAX   3000U    /* 3000ms */
+#define AP_EEPROM_IR_DEFAULT_DZ_38     15U      /* 3.8um固定ZCR死区 */
+#define AP_EEPROM_IR_DEFAULT_DZ_45     15U      /* 4.5um固定ZCR死区 */
+#define AP_EEPROM_IR_DEFAULT_DZ_50     10U      /* 5.0um固定ZCR死区 */
 
 /* ========================================================================== */
 /*                        公有 API                                             */
