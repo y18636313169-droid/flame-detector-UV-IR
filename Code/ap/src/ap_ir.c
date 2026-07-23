@@ -77,13 +77,14 @@
  *   ON       = 当前等级的power_threshold，P45达到该值视为出现有效火焰能量；
  *   OFF      = power_off_threshold，ON的40%，用于安静和迟滞判断；
  *   PEAK     = 首次达到ON后0~2.5秒内的最大P45；
- *   LATE     = 2.5~3.5秒稳定观察段内P45的算术平均值；
+ *   LATE     = 2.5~3.5秒稳定段内P45>=OFF有效样本的算术平均值；
  *   R1000    = LATE/PEAK×1000，例如400表示后期保留峰值的40%；
  *   DUTY1000 = 观察段内P45>=OFF的样本占比×1000，例如600表示60%。
  *
  * PROFILE不影响IR进入WARNING及其证据积分，两个过程每10ms并行更新。只有
  * WARNING准备进入FIRE时才读取PROFILE结论：OBS先提前收口，LIGHTER阻止本次
- * FIRE，SUSTAINED或高灵敏度下数据不足则放行。若启动后始终未进入WARNING，
+ * FIRE，但可在后续能量持续恢复时单向升级为SUSTAINED；SUSTAINED禁止反向降级。
+ * 高灵敏度下分类数据不足则放行。若启动后始终未进入WARNING，
  * P45低于OFF连续1秒即丢弃本次预采集并直接重新ARMED，不提交分类终态。
  */
 #define IR_PROFILE_QUIET_MS                (1000U) /* 布防条件：P45连续低于OFF的时间，单位ms */
@@ -92,13 +93,18 @@
 #define IR_PROFILE_LATE_START_MS           (2500U) /* 稳定窗起点：紧接峰值窗，单位ms */
 #define IR_PROFILE_OBSERVE_END_MS          (3500U) /* 稳定窗终点：完成首次分类的相对时间，单位ms */
 #define IR_PROFILE_DECAY_RATIO_X1000        (400U) /* LATE/PEAK门限：400表示40.0% */
+#define IR_PROFILE_LIGHTER_PEAK_MIN       (190000U) /* 打火机峰值门槛：低能量启动沿不参与打火机分类 */
+#define IR_PROFILE_RECOVERY_WINDOW_MS       (1000U) /* LIGHTER后持续火焰恢复判定窗口，单位ms */
+#define IR_PROFILE_RECOVERY_DUTY_X1000       (600U) /* 恢复窗口内P45>=OFF至少占60%，避免单点峰值升级 */
 
 #if (IR_PROFILE_PEAK_END_MS > IR_PROFILE_LATE_START_MS) || \
     (IR_PROFILE_LATE_START_MS >= IR_PROFILE_OBSERVE_END_MS) || \
     ((IR_PROFILE_QUIET_MS % IR_PROCESS_STEP_MS) != 0U) || \
     ((IR_PROFILE_RELEASE_MS % IR_PROCESS_STEP_MS) != 0U) || \
     ((IR_PROFILE_OBSERVE_END_MS % IR_PROCESS_STEP_MS) != 0U) || \
-    (IR_PROFILE_DECAY_RATIO_X1000 > 1000U)
+    ((IR_PROFILE_RECOVERY_WINDOW_MS % IR_PROCESS_STEP_MS) != 0U) || \
+    (IR_PROFILE_DECAY_RATIO_X1000 > 1000U) || \
+    (IR_PROFILE_RECOVERY_DUTY_X1000 > 1000U)
 #error "IR transient profile parameters are invalid"
 #endif
 
@@ -141,11 +147,13 @@ typedef struct {
     ARMED  --P45首次达到ON---------------> OBSERVING
     OBSERVING --已进入WARNING且观察到期/FIRE就绪--> LIGHTER/SUSTAINED
     OBSERVING --从未进入WARNING且P45<OFF持续1秒--> ARMED
+    LIGHTER --有效能量持续恢复------------> SUSTAINED
     LIGHTER/SUSTAINED --P45<OFF持续2秒-----> BYPASS
     BYPASS --P45<OFF重新持续1秒------------> ARMED
 
   BYPASS表示尚未观察到完整的“安静背景->点火”过程，此时没有有效包络分类；
-  LIGHTER和SUSTAINED是同一次点火沿的最终分类，火源未消退前禁止互相转换。
+  LIGHTER是可恢复的干扰结论，后续出现持续真实火焰时只允许升级为SUSTAINED；
+  SUSTAINED是本次火源的最终结论，禁止反向降级为LIGHTER。
   消退后必须先回BYPASS，再重新完成安静布防，下一次ON上穿沿才开始新分类。
   PROFILE不暂停IR确认积分；仅进入过WARNING的事件才提交分类结果。没有进入
   WARNING的短瞬态在安静1秒后直接丢弃并重新ARMED，不产生额外2秒锁存时间。
@@ -154,27 +162,30 @@ typedef enum {
     IR_PROFILE_BYPASS = 0, /* 未布防：等待新的完整安静期 */
     IR_PROFILE_ARMED,      /* 已布防：已确认安静背景，等待P45第一次跨过ON */
     IR_PROFILE_OBSERVING,  /* 采集/等待中：记录包络并等待WARNING或安静取消 */
-    IR_PROFILE_LIGHTER,    /* 本次点火沿分类为打火机，锁存到火源消退 */
+    IR_PROFILE_LIGHTER,    /* 当前识别为打火机干扰，可单向升级为持续火焰 */
     IR_PROFILE_SUSTAINED   /* 本次点火沿分类为持续火焰，锁存到火源消退 */
 } IR_ProfileState_t;
 
 /**
   @brief  主通道点火包络分类上下文
 
-  late_sum/late_samples/late_high_samples仅在OBSERVING的2.5~3.5秒稳定段累计；
-  分类完成后不再更新这些值。low_power_accum_ms在不同状态下有三种明确语义：
+  late_sum/late_samples/late_high_samples在OBS稳定段和LIGHTER恢复窗口复用：
+    - late_sum只累加P45>=OFF的有效样本，低于OFF的样本不进入能量均值；
+    - late_samples记录窗口总样本数，仅用于计算有效占空比；
+    - late_high_samples记录有效样本数，也是late_sum计算均值时的分母。
+  low_power_accum_ms在不同状态下有三种明确语义：
     - BYPASS：重新布防前的连续安静时间；
     - OBSERVING且未见WARNING：判定无效短瞬态的连续安静时间；
     - LIGHTER/SUSTAINED：确认本次火源已经消退的连续低功率时间。
  */
 typedef struct {
     IR_ProfileState_t state;             /* 当前包络分类状态 */
-    uint32_t phase_start_ms;             /* OBSERVING观察窗口起始tick，单位ms */
+    uint32_t phase_start_ms;             /* OBS观察或LIGHTER恢复窗口的起始tick，单位ms */
     uint32_t low_power_accum_ms;         /* 当前阶段P45连续低于OFF的累计时间，单位ms */
     uint32_t early_peak;                 /* 首次跨过ON后0~2.5秒内P45最大值 */
-    uint64_t late_sum;                   /* 2.5~3.5秒稳定段的P45累加和 */
-    uint16_t late_samples;               /* late_sum包含的10ms样本数量 */
-    uint16_t late_high_samples;          /* 上述样本中P45>=OFF的样本数量 */
+    uint64_t late_sum;                   /* 当前后段窗口内P45>=OFF有效样本的累加和 */
+    uint16_t late_samples;               /* 当前后段窗口的全部10ms样本数量 */
+    uint16_t late_high_samples;          /* 当前后段窗口内P45>=OFF的有效样本数量 */
     uint8_t warning_seen;                /* 本次观察是否实际进入过IR WARNING */
 } IR_Profile_t;
 
@@ -888,8 +899,9 @@ static void ignition_profile_arm_if_quiet(IR_Detector_t *d, uint32_t power)
   @param  d: 检测器实例
   @param  now: 当前毫秒tick
   @param  power: 当前4.5um的0.5秒滚动均方值
-  @note   终态锁存期间禁止LIGHTER和SUSTAINED互相转换。只有P45连续低于OFF
-          满2秒才确认本次火源结束并回到BYPASS；期间只要恢复到OFF以上就清除
+  @note   LIGHTER可由独立恢复函数单向升级为SUSTAINED，SUSTAINED不会反向降级。
+          两种状态都只有在P45连续低于OFF满2秒后才确认本次火源结束并回到BYPASS；
+          期间只要恢复到OFF以上就清除
           掉线计时。BYPASS还需重新累计1秒安静时间才能进入ARMED，因此旧火源
           的短暂低谷或稳定尾段不会被当成新的点火沿。
  */
@@ -1011,6 +1023,78 @@ static uint32_t ignition_profile_duty_x1000(uint16_t high_samples,
 }
 
 /**
+  @brief  LIGHTER状态下检查后续是否已经转变为持续真实火焰
+  @param  d: 检测器实例
+  @param  now: 当前毫秒tick
+  @param  power: 当前4.5um滚动均方值
+
+  LIGHTER不是永久锁存结论。分类完成后按1秒窗口继续观察主通道，但均值只统计
+  P45>=OFF的有效样本，低谷样本仅计入窗口总数以形成DUTY1000。有效均值恢复到
+  原启动峰值的40%以上且有效占空比达到60%时，说明后续能量已经持续恢复，
+  允许LIGHTER单向升级为SUSTAINED。SUSTAINED没有反向迁移路径。
+
+  同时保留连续低于OFF满2秒的释放规则；因此打火机熄灭会先回BYPASS，而不会
+  因为低谷样本被平均进去产生虚假的恢复结论。
+  */
+static void ignition_profile_recover_sustained(IR_Detector_t *d,
+                                                uint32_t now,
+                                                uint32_t power)
+{
+    IR_Profile_t *profile = &d->profile;
+    uint32_t valid_mean;
+    uint32_t ratio_x1000;
+    uint32_t duty_x1000;
+
+    ignition_profile_release_if_quiet(d, now, power);
+    if (profile->state != IR_PROFILE_LIGHTER) return;
+
+    profile->late_samples++;
+    if (power >= d->power_off_threshold) {
+        profile->late_sum += power;
+        profile->late_high_samples++;
+    }
+
+    if ((now - profile->phase_start_ms) < IR_PROFILE_RECOVERY_WINDOW_MS) {
+        return;
+    }
+
+    valid_mean = ignition_profile_mean(profile->late_sum,
+                                       profile->late_high_samples);
+    ratio_x1000 = (profile->early_peak == 0U) ? 0U
+        : (uint32_t)(((uint64_t)valid_mean * 1000U) /
+                     profile->early_peak);
+    duty_x1000 = ignition_profile_duty_x1000(
+        profile->late_high_samples, profile->late_samples);
+
+    /*
+     * 升级必须同时满足“能量恢复幅度”和“持续时间占比”。单个高峰即使数值很大，
+     * DUTY1000也不足，不会把仍在燃烧的打火机误升级为持续火焰。
+     */
+    if (profile->late_high_samples != 0U &&
+        ratio_x1000 >= IR_PROFILE_DECAY_RATIO_X1000 &&
+        duty_x1000 >= IR_PROFILE_RECOVERY_DUTY_X1000) {
+        profile->state = IR_PROFILE_SUSTAINED;
+        profile->low_power_accum_ms = 0U;
+        DBG("T%lu PROFILE LIGHTER -> SUSTAINED MEAN=%lu R1000=%lu DUTY1000=%lu PEAK=%lu",
+            (unsigned long)now, (unsigned long)valid_mean,
+            (unsigned long)ratio_x1000, (unsigned long)duty_x1000,
+            (unsigned long)profile->early_peak);
+    } else {
+        DBG("T%lu PROFILE recovery pending MEAN=%lu R1000=%lu DUTY1000=%lu VALID=%u/%u",
+            (unsigned long)now, (unsigned long)valid_mean,
+            (unsigned long)ratio_x1000, (unsigned long)duty_x1000,
+            (unsigned int)profile->late_high_samples,
+            (unsigned int)profile->late_samples);
+    }
+
+    /* 每个恢复窗口独立统计，避免旧低谷无限稀释后续真实火焰的能量。 */
+    profile->phase_start_ms = now;
+    profile->late_sum = 0U;
+    profile->late_samples = 0U;
+    profile->late_high_samples = 0U;
+}
+
+/**
   @brief  使用当前已收集数据结束本次点火包络观察
   @param  d: 检测器实例
   @param  now: 当前毫秒tick
@@ -1040,8 +1124,12 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
     if (profile->state != IR_PROFILE_OBSERVING ||
         profile->warning_seen == 0U) return;
 
+    /*
+     * LATE只代表仍高于OFF的有效火焰能量。低于OFF的样本不进入均值，
+     * 避免酒精火焰短时低谷把后段均值压成约2000并被误判为快速衰减。
+     */
     late_mean = ignition_profile_mean(profile->late_sum,
-                                      profile->late_samples);
+                                      profile->late_high_samples);
     ratio_x1000 = (profile->early_peak == 0U) ? 1000U
         : (uint32_t)(((uint64_t)late_mean * 1000U) /
                      profile->early_peak);
@@ -1049,11 +1137,13 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
         profile->late_high_samples, profile->late_samples);
 
     /*
-     * 只有峰值有效且至少取得一个后段样本时才允许判LIGHTER。无后段数据时
-     * ratio虽然会计算为0，但不能据此误判快速衰减，必须按SUSTAINED放行。
+     * 打火机分类必须同时满足固定的24万峰值门槛、至少一个OFF以上有效后段样本、
+     * 以及LATE/PEAK<40%。24万用于排除此前2万级的小启动沿；它不是火焰进场
+     * 阈值，也不随灵敏度变化。无有效后段数据时不能用低于OFF的样本证明衰减，
+     * 按SUSTAINED放行，优先避免真实火焰漏报。
      */
-    if (profile->early_peak >= d->power_threshold &&
-        profile->late_samples != 0U &&
+    if (profile->early_peak >= IR_PROFILE_LIGHTER_PEAK_MIN &&
+        profile->late_high_samples != 0U &&
         ratio_x1000 < IR_PROFILE_DECAY_RATIO_X1000) {
         profile->state = IR_PROFILE_LIGHTER;
     } else {
@@ -1061,19 +1151,24 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
     }
 
 #if defined(AP_ALGO_DEBUG_ENABLE)
-    DBG("T%lu PROFILE result=%s PEAK=%lu LATE=%lu R1000=%lu DUTY1000=%lu OBS=%lu MODE=%s",
+    DBG("T%lu PROFILE result=%s PEAK=%lu PMIN=%lu LATE=%lu R1000=%lu DUTY1000=%lu VALID=%u/%u OBS=%lu MODE=%s",
         (unsigned long)now, ir_profile_name(profile->state),
-        (unsigned long)profile->early_peak, (unsigned long)late_mean,
+        (unsigned long)profile->early_peak,
+        (unsigned long)IR_PROFILE_LIGHTER_PEAK_MIN,
+        (unsigned long)late_mean,
         (unsigned long)ratio_x1000, (unsigned long)duty_x1000,
+        (unsigned int)profile->late_high_samples,
+        (unsigned int)profile->late_samples,
         (unsigned long)observe_ms,
         (fire_deadline != 0U) ? "FIRE_READY" : "FULL");
 #endif
 
     /*
-     * LIGHTER/SUSTAINED均为本次点火沿的最终结论。分类后只保留终态并等待
-     * 连续2秒掉线，禁止同一火源根据后续稳定尾段在两个结论之间转换。
+     * LIGHTER保留early_peak作为后续恢复基准，并从分类完成时启动新的1秒恢复窗；
+     * 它只能升级为SUSTAINED。SUSTAINED不会反向降级，两者仍使用2秒掉线释放。
      */
     profile->low_power_accum_ms = 0U;
+    profile->phase_start_ms = now;
     profile->late_sum = 0U;
     profile->late_samples = 0U;
     profile->late_high_samples = 0U;
@@ -1089,10 +1184,11 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
     - 2.5~3.5秒：累计衰减后的late_mean和P45>=OFF的late_duty。
 
   P45本身已经是0.5秒滚动均方值，因此early_peak不是ADC单点毛刺。按照现场
-  特征，late/peak<40%标记为LIGHTER，其他情况标记为SUSTAINED；late_duty
-  仅用于日志观察，不参与本次分类。若WARNING先达到确认时间，则在FIRE迁移
-  前使用已有数据提前结束观察。两个终态都锁存到P45低于OFF满2秒，随后回到
-  BYPASS并重新安静布防。
+  特征，仅当PEAK>=24万、有OFF以上有效后段样本且late/peak<40%时标记为
+  LIGHTER，其他情况标记为SUSTAINED。低于OFF的样本不参与late均值，只进入
+  late_duty分母。若WARNING先达到确认时间，则在FIRE迁移前使用已有数据提前
+  结束观察。LIGHTER后续按1秒窗口检查有效能量，满足恢复幅度与占空比后只允许
+  单向升级为SUSTAINED；两种状态均在P45低于OFF满2秒后回BYPASS重新布防。
  */
 static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
 {
@@ -1127,7 +1223,7 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
         }
 
         /*
-         * 阶段1，t=[0,3s)：只更新P45最大值。即使P45首次超过ON后继续升高，
+         * 阶段1，t=[0,2.5s)：只更新P45最大值。即使P45首次超过ON后继续升高，
          * early_peak也会跟随更新，因此不会把第一次过阈值值误当成峰值。
          */
         if (elapsed < IR_PROFILE_PEAK_END_MS) {
@@ -1138,15 +1234,16 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
         }
 
         /*
-         * 阶段2，t=[3s,4s)：峰值已经锁定，独立统计后期稳定能量。
-         * late_sum/late_samples得到LATE均值；late_high_samples用于计算
-         * P45处于OFF以上的时间占比，仅用于日志观察本次稳定段特征。
+         * 阶段2，t=[2.5s,3.5s)：峰值已经锁定，独立统计后期稳定能量。
+         * late_samples记录窗口总样本数；只有P45>=OFF时才写入late_sum并增加
+         * late_high_samples。LATE使用有效样本数作分母，低于OFF的低谷不会
+         * 参与均值；总样本数仍保留用于输出有效时间占比DUTY1000。
          */
         if (elapsed >= IR_PROFILE_LATE_START_MS &&
             elapsed < IR_PROFILE_OBSERVE_END_MS) {
-            profile->late_sum += power;         /* 稳定值累加求均值 */
             profile->late_samples++;
             if (power >= d->power_off_threshold) {
+                profile->late_sum += power;
                 profile->late_high_samples++;
             }
             return;
@@ -1164,9 +1261,17 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
         return;
     }
 
-    if (profile->state == IR_PROFILE_LIGHTER ||
-        profile->state == IR_PROFILE_SUSTAINED) {
-        /* 终态只等待本次火源消退，不再根据稳定尾段改写分类结论。 */
+    if (profile->state == IR_PROFILE_LIGHTER) {
+        /*
+         * LIGHTER允许后续真实火焰使能量持续恢复后单向升级；该路径不会清除或
+         * 暂停WARNING积分，升级完成的同一周期即可继续检查FIRE迁移。
+         */
+        ignition_profile_recover_sustained(d, now, power);
+        return;
+    }
+
+    if (profile->state == IR_PROFILE_SUSTAINED) {
+        /* SUSTAINED为单向最终结论，只等待本次火源连续低于OFF满2秒后释放。 */
         ignition_profile_release_if_quiet(d, now, power);
         return;
     }

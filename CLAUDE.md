@@ -272,11 +272,12 @@ Feed(ADC值→每通道连续20Hz IIR→200点历史缓存) → ZCR窗口满后:
   → 五判据全部通过: IDLE→WARNING
   → P45安静布防后第一次跨过当前等级ON时，并行启动3.5秒主通道包络分类
       0~2.5秒: 持续记录0.5秒滚动均方值的启动最高峰early_peak
-      2.5~3.5秒: 独立统计衰减后late_mean及P45≥当前OFF占空比late_duty
+      2.5~3.5秒: late_mean只统计P45≥当前OFF的有效样本，全部样本仅用于late_duty
       WARNING证据先满足: FIRE迁移前立即使用已有数据提前完成分类
-      有后段样本且late/peak<40%: 本次点火沿分类为LIGHTER并阻止FIRE
+      PEAK≥240000、有有效后段样本且late/peak<40%: 分类为LIGHTER并阻止FIRE
       其他情况或高灵敏度下后段数据不足: 分类为SUSTAINED并放行FIRE
-      两个终态都锁存到P45<当前OFF连续2秒，再回BYPASS重新安静1秒布防
+      LIGHTER后每1秒检查恢复；有效均值≥PEAK的40%且有效占比≥60%时单向升级为SUSTAINED
+      SUSTAINED禁止反向降级；两者P45<当前OFF连续2秒后回BYPASS并重新布防
       WARNING掉线超时且PROFILE仍为OBS: 取消本次观察并回BYPASS
       PROFILE不阻塞或清除WARNING证据积分，只在最终FIRE迁移点读取结论
 ```
@@ -294,7 +295,7 @@ IDLE ──(功率≥当前ON且五判据通过)──→ WARNING ──(积分�
 - **固定ZCR死区**: 上电从EEPROM直接加载三通道死区，默认15/15/10，不使用启动阶段数据自动标定
 - **手动死区标定**: `ir cal start`后预热5秒，再采集5个互不重叠的2秒窗口；每窗口计算各通道P90(|AC|)，取5次中位数×1.5并限幅到10~30，保存EEPROM后立即生效
 - **功率抗抖**: ON按等级在12000~22000插值，OFF固定为当前ON的40%，两者仅约束4.5μm主通道；WARNING内主通道功率达到ON或处于OFF~ON迟滞区时有效积分每周期+10ms，功率低于OFF时每周期-10ms，连续2秒后退出WARNING
-- **点火包络分类**: BYPASS下P45低于当前OFF满1秒后进入ARMED；第一次跨过当前ON立即记录启动事件，使用0~2.5秒峰值及2.5~3.5秒后段均值分类。PROFILE和WARNING积分每10ms并行运行；若始终未进入WARNING且P45低于OFF满1秒，直接取消观察并回ARMED，不输出分类终态；若积分先达到confirm_ms，必须在FIRE迁移前使用已有数据提前收口。有后段样本且late/peak<40%时判为LIGHTER并阻止本次FIRE；后段数据不足按高灵敏度降级策略判为SUSTAINED放行，保证不因分类数据不足漏报。两个终态不在同一火源期间互相转换，P45连续低于当前OFF满2秒才回BYPASS，再安静1秒布防下一次点火沿；WARNING掉线超时时会取消尚未完成的OBS。PROFILE不暂停或清除WARNING积分
+- **点火包络分类**: BYPASS下P45低于当前OFF满1秒后进入ARMED；第一次跨过当前ON立即记录启动事件，使用0~2.5秒峰值及2.5~3.5秒后段数据分类。后段均值只统计P45≥OFF的有效样本，低于OFF的低谷不参与均值。PROFILE和WARNING积分每10ms并行运行；若始终未进入WARNING且P45低于OFF满1秒，直接取消观察并回ARMED；若积分先达到confirm_ms，必须在FIRE迁移前使用已有数据提前收口。仅PEAK≥240000、有有效后段样本且late/peak<40%时判为LIGHTER并阻止FIRE，其余情况按SUSTAINED放行。LIGHTER并非永久锁存：后续每1秒检查一次，有效均值恢复至原PEAK的40%以上且P45≥OFF占比达到60%时单向升级为SUSTAINED；SUSTAINED禁止反向降级。P45连续低于OFF满2秒后回BYPASS，再安静1秒布防下一次点火沿；PROFILE不暂停或清除WARNING积分
 - **频率锁存**: ZCR范围和三通道一致性只作为IDLE进入WARNING的门槛；WARNING不重复检查滚动ZCR，避免0.25Hz量化台阶清空确认进度
 - **EEPROM版本**: UV为v3；IR为v6，旧v5缺少固定死区，首次启动时自动恢复为v6默认值
 
@@ -420,7 +421,7 @@ TIM6 → AP_UART_CheckTimeout() + 置位标志(IR_feed_pending, test_print_pendi
 
 取消 `Code/ap/inc/ap_util.h` 中该宏的注释后，IR算法输出初始化参数、200点窗口就绪、每500ms特征快照、限频后的判据失败、功率掉线/恢复、点火包络分类、状态迁移及FIRE超时；UV算法输出每500ms窗口计数/覆盖统计和状态迁移；最终IR&&UV报警沿输出独立的`[ALARM]`日志。宏关闭时相关计时变量和日志函数不参与编译。
 
-手动标定时输出每个窗口的`[IR] ZCR_CAL window=<n>/5 P90=<...>`以及保存结果`[IR] ZCR_CAL saved DZ=<...>`；特征快照增加`PROF=BYPASS|ARMED|OBS|LIGHTER|SUSTAINED`。首次跨过当前等级ON输出`PROFILE onset P=<...> ON=<...>`；分类输出`PROFILE result=<...> PEAK=<...> LATE=<...> R1000=<...> DUTY1000=<...> OBS=<ms> MODE=FULL|FIRE_READY`，其中FIRE_READY保证分类早于FIRE；未进入WARNING且安静满1秒输出`PROFILE canceled ... REASON=NO_WARNING_QUIET ... -> ARMED`，WARNING超时取消则输出`REASON=WARNING_RESET -> BYPASS`；连续掉线2秒释放终态输出`PROFILE released ... -> BYPASS`。
+手动标定时输出每个窗口的`[IR] ZCR_CAL window=<n>/5 P90=<...>`以及保存结果`[IR] ZCR_CAL saved DZ=<...>`；特征快照增加`PROF=BYPASS|ARMED|OBS|LIGHTER|SUSTAINED`。首次跨过当前等级ON输出`PROFILE onset P=<...> ON=<...>`；分类输出`PROFILE result=<...> PEAK=<...> PMIN=240000 LATE=<...> R1000=<...> DUTY1000=<...> VALID=<有效数>/<总数> OBS=<ms> MODE=FULL|FIRE_READY`；LIGHTER恢复窗口输出`PROFILE recovery pending ...`，满足单向升级时输出`PROFILE LIGHTER -> SUSTAINED ...`；未进入WARNING且安静满1秒输出`PROFILE canceled ... REASON=NO_WARNING_QUIET ... -> ARMED`，WARNING超时取消则输出`REASON=WARNING_RESET -> BYPASS`；连续掉线2秒释放输出`PROFILE released ... -> BYPASS`。
 
 ## 项目进度
 
