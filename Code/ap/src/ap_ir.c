@@ -67,17 +67,18 @@
  * 打火机在点火瞬间会产生很高的4.5um功率峰值，随后稳定功率快速下降；
  * 酒精火盆则通常由较低初始能量逐步进入持续、密集的稳定燃烧。这里不比较
  * 单点ADC毛刺，而是在有效冷启动后由P45第一次跨过当前等级ON阈值立即开始观察：
- * 前2.5秒持续记录0.5秒滚动均方值的最高峰，覆盖打火机常见的“继续增大后快速
- * 衰减”全过程；随后1秒独立统计衰减后的稳定能量和迟滞下限占空比。峰值窗
- * 与对比窗不重叠，避免最大值出现在第3秒附近时把稳定均值一起抬高。启动捕获
+ * 前1.5秒持续记录0.5秒滚动均方值的最高峰，覆盖打火机约1秒内完成的
+ * “0->峰值->快速衰减”过程；随后最多1.5秒独立统计衰减后的稳定能量和迟滞
+ * 下限占空比。峰值窗与稳定窗不重叠；若WARNING先达到FIRE确认条件，稳定窗
+ * 立即使用已采样本提前收口，不强制等待最大窗口结束。启动捕获
  * 不等待光谱/ZCR，因而不会遗漏真实点火峰值。
  *
  * 本段变量/日志术语：
  *   P45      = 4.5um主通道最近0.5秒去直流信号的均方值；
  *   ON       = 当前等级的power_threshold，P45达到该值视为出现有效火焰能量；
  *   OFF      = power_off_threshold，ON的40%，用于安静和迟滞判断；
- *   PEAK     = 首次达到ON后0~2.5秒内的最大P45；
- *   LATE     = 2.5~3.5秒稳定段内P45>=OFF有效样本的算术平均值；
+ *   PEAK     = 首次达到ON后0~1.5秒内的最大P45；
+ *   LATE     = 1.5秒后至FIRE_READY/最大3秒之间，P45>=OFF有效样本的平均值；
  *   R1000    = LATE/PEAK×1000，例如400表示后期保留峰值的40%；
  *   DUTY1000 = 观察段内P45>=OFF的样本占比×1000，例如600表示60%。
  *
@@ -89,20 +90,29 @@
  */
 #define IR_PROFILE_QUIET_MS                (1000U) /* 布防条件：P45连续低于OFF的时间，单位ms */
 #define IR_PROFILE_RELEASE_MS  (IR_POWER_DROPOUT_MS) /* 终态释放沿用WARNING连续掉线超时 */
-#define IR_PROFILE_PEAK_END_MS             (2500U) /* 峰值窗终点：首次跨过ON后的相对时间，单位ms */
-#define IR_PROFILE_LATE_START_MS           (2500U) /* 稳定窗起点：紧接峰值窗，单位ms */
-#define IR_PROFILE_OBSERVE_END_MS          (3500U) /* 稳定窗终点：完成首次分类的相对时间，单位ms */
+#define IR_PROFILE_PEAK_WINDOW_MS          (1500U) /* 峰值窗固定时长：覆盖打火机启动峰值及快速衰减 */
+#define IR_PROFILE_LATE_WINDOW_MAX_MS      (1500U) /* 稳定窗最大时长；FIRE_READY可在中途提前收口 */
+#define IR_PROFILE_LATE_START_MS  (IR_PROFILE_PEAK_WINDOW_MS) /* 稳定窗紧接峰值窗 */
+#define IR_PROFILE_OBSERVE_END_MS \
+    (IR_PROFILE_LATE_START_MS + IR_PROFILE_LATE_WINDOW_MAX_MS) /* 完整观察最大时长 */
 #define IR_PROFILE_DECAY_RATIO_X1000        (400U) /* LATE/PEAK门限：400表示40.0% */
-#define IR_PROFILE_LIGHTER_PEAK_MIN       (190000U) /* 打火机峰值门槛：低能量启动沿不参与打火机分类 */
+#define IR_PROFILE_LIGHTER_PEAK_MIN       (100000U) /* 打火机峰值门槛：低能量启动沿不参与打火机分类 */
 #define IR_PROFILE_RECOVERY_WINDOW_MS       (1000U) /* LIGHTER后持续火焰恢复判定窗口，单位ms */
+#define IR_PROFILE_RECOVERY_POWER_MIN      (50000U) /* 恢复窗有效均值门槛：5万以上视为真实火焰候选 */
+#define IR_PROFILE_RECOVERY_CONFIRM_WINDOWS    (2U) /* 连续通过2个恢复窗才升级，拒绝单窗偶发高值 */
 #define IR_PROFILE_RECOVERY_DUTY_X1000       (600U) /* 恢复窗口内P45>=OFF至少占60%，避免单点峰值升级 */
 
-#if (IR_PROFILE_PEAK_END_MS > IR_PROFILE_LATE_START_MS) || \
-    (IR_PROFILE_LATE_START_MS >= IR_PROFILE_OBSERVE_END_MS) || \
+#if (IR_PROFILE_PEAK_WINDOW_MS != IR_PROFILE_LATE_START_MS) || \
+    (IR_PROFILE_LATE_WINDOW_MAX_MS == 0U) || \
     ((IR_PROFILE_QUIET_MS % IR_PROCESS_STEP_MS) != 0U) || \
     ((IR_PROFILE_RELEASE_MS % IR_PROCESS_STEP_MS) != 0U) || \
+    ((IR_PROFILE_PEAK_WINDOW_MS % IR_PROCESS_STEP_MS) != 0U) || \
+    ((IR_PROFILE_LATE_WINDOW_MAX_MS % IR_PROCESS_STEP_MS) != 0U) || \
     ((IR_PROFILE_OBSERVE_END_MS % IR_PROCESS_STEP_MS) != 0U) || \
     ((IR_PROFILE_RECOVERY_WINDOW_MS % IR_PROCESS_STEP_MS) != 0U) || \
+    (IR_PROFILE_RECOVERY_POWER_MIN == 0U) || \
+    (IR_PROFILE_RECOVERY_CONFIRM_WINDOWS == 0U) || \
+    (IR_PROFILE_RECOVERY_CONFIRM_WINDOWS > 255U) || \
     (IR_PROFILE_DECAY_RATIO_X1000 > 1000U) || \
     (IR_PROFILE_RECOVERY_DUTY_X1000 > 1000U)
 #error "IR transient profile parameters are invalid"
@@ -147,14 +157,15 @@ typedef struct {
     ARMED  --P45首次达到ON---------------> OBSERVING
     OBSERVING --已进入WARNING且观察到期/FIRE就绪--> LIGHTER/SUSTAINED
     OBSERVING --从未进入WARNING且P45<OFF持续1秒--> ARMED
-    BYPASS --IR已进入WARNING/FIRE----------> SUSTAINED
+    BYPASS --当周期P45>=ON且正常IR判据通过--> SUSTAINED
     LIGHTER --有效能量持续恢复------------> SUSTAINED
     LIGHTER/SUSTAINED --P45<OFF持续2秒-----> BYPASS
     BYPASS --P45<OFF重新持续1秒------------> ARMED
 
   BYPASS表示尚未观察到完整的“安静背景->点火”过程，此时没有有效包络分类；
   若设备面对已经燃烧且持续波动的火焰，P45可能无法连续低于OFF满1秒。此时正常
-  IR状态机一旦独立进入WARNING/FIRE，BYPASS按热启动直接接纳为SUSTAINED。
+  正常IR状态机当周期确认P45>=ON且光谱/频率判据通过后，BYPASS才按热启动
+  直接接纳为SUSTAINED，不能使用掉线宽限期内遗留的旧WARNING状态。
   LIGHTER是可恢复的干扰结论，后续出现持续真实火焰时只允许升级为SUSTAINED；
   SUSTAINED是本次火源的最终结论，禁止反向降级为LIGHTER。
   消退后必须先回BYPASS，再重新完成安静布防，下一次ON上穿沿才开始新分类。
@@ -176,6 +187,9 @@ typedef enum {
     - late_sum只累加P45>=OFF的有效样本，低于OFF的样本不进入能量均值；
     - late_samples记录窗口总样本数，仅用于计算有效占空比；
     - late_high_samples记录有效样本数，也是late_sum计算均值时的分母。
+  recovery_pass_windows记录连续满足恢复判据的1秒窗口数量。恢复能量采用或关系：
+  有效均值>=5万，或有效均值恢复到启动峰值的40%以上；两条路径都必须同时满足
+  有效占比>=60%。任一窗口不通过立即清零，连续2窗通过才允许升级。
   low_power_accum_ms在不同状态下有三种明确语义：
     - BYPASS：重新布防前的连续安静时间；
     - OBSERVING且未见WARNING：判定无效短瞬态的连续安静时间；
@@ -185,11 +199,12 @@ typedef struct {
     IR_ProfileState_t state;             /* 当前包络分类状态 */
     uint32_t phase_start_ms;             /* OBS观察或LIGHTER恢复窗口的起始tick，单位ms */
     uint32_t low_power_accum_ms;         /* 当前阶段P45连续低于OFF的累计时间，单位ms */
-    uint32_t early_peak;                 /* 首次跨过ON后0~2.5秒内P45最大值 */
+    uint32_t early_peak;                 /* 首次跨过ON后0~1.5秒内P45最大值 */
     uint64_t late_sum;                   /* 当前后段窗口内P45>=OFF有效样本的累加和 */
     uint16_t late_samples;               /* 当前后段窗口的全部10ms样本数量 */
     uint16_t late_high_samples;          /* 当前后段窗口内P45>=OFF的有效样本数量 */
     uint8_t warning_seen;                /* 本次观察是否实际进入过IR WARNING */
+    uint8_t recovery_pass_windows;       /* LIGHTER连续通过恢复判据的1秒窗口数量 */
 } IR_Profile_t;
 
 /**
@@ -1032,9 +1047,15 @@ static uint32_t ignition_profile_duty_x1000(uint16_t high_samples,
   @param  power: 当前4.5um滚动均方值
 
   LIGHTER不是永久锁存结论。分类完成后按1秒窗口继续观察主通道，但均值只统计
-  P45>=OFF的有效样本，低谷样本仅计入窗口总数以形成DUTY1000。有效均值恢复到
-  原启动峰值的40%以上且有效占空比达到60%时，说明后续能量已经持续恢复，
-  允许LIGHTER单向升级为SUSTAINED。SUSTAINED没有反向迁移路径。
+  P45>=OFF的有效样本，低谷样本仅计入窗口总数以形成DUTY1000。由于30cm酒精盆
+  点火瞬间可能出现170万级轰燃峰值，后续真实稳定火焰即使维持6万~几十万，
+  相对启动峰值也可能远低于40%，因此必须保留固定5万的绝对恢复路径。同时，
+  固定阈值会受距离、镜片透过率和器件增益影响，远距离真实火焰可能达不到5万，
+  因此也保留恢复到启动峰值40%以上的相对路径，两条能量路径使用或关系。
+
+  无论通过绝对路径还是相对路径，都要求有效占比>=60%，并连续通过2个1秒窗口
+  后才允许LIGHTER单向升级为SUSTAINED。第一次通过只累计确认次数；任一窗口
+  不通过便清零，可防止近距离打火机偶发一个窗口超过5万时被误升级。
 
   同时保留连续低于OFF满2秒的释放规则；因此打火机熄灭会先回BYPASS，而不会
   因为低谷样本被平均进去产生虚假的恢复结论。
@@ -1047,6 +1068,9 @@ static void ignition_profile_recover_sustained(IR_Detector_t *d,
     uint32_t valid_mean;
     uint32_t ratio_x1000;
     uint32_t duty_x1000;
+    bool absolute_pass;
+    bool relative_pass;
+    bool window_pass;
 
     ignition_profile_release_if_quiet(d, now, power);
     if (profile->state != IR_PROFILE_LIGHTER) return;
@@ -1070,22 +1094,47 @@ static void ignition_profile_recover_sustained(IR_Detector_t *d,
         profile->late_high_samples, profile->late_samples);
 
     /*
-     * 升级必须同时满足“能量恢复幅度”和“持续时间占比”。单个高峰即使数值很大，
-     * DUTY1000也不足，不会把仍在燃烧的打火机误升级为持续火焰。
+     * 绝对能量和相对恢复使用或关系，避免任何单一标尺覆盖全部距离和硬件差异：
+     *   - absolute_pass处理巨大轰燃峰值后仍稳定在5万以上的真实火焰；
+     *   - relative_pass处理整体幅值偏小、但相对启动峰值恢复明显的真实火焰。
+     * 两条路径共同受有效样本和占空比约束，再由连续窗口计数过滤偶发越线。
      */
-    if (profile->late_high_samples != 0U &&
-        ratio_x1000 >= IR_PROFILE_DECAY_RATIO_X1000 &&
-        duty_x1000 >= IR_PROFILE_RECOVERY_DUTY_X1000) {
+    absolute_pass = valid_mean >= IR_PROFILE_RECOVERY_POWER_MIN;
+    relative_pass = ratio_x1000 >= IR_PROFILE_DECAY_RATIO_X1000;
+    window_pass = (profile->late_high_samples != 0U) &&
+                  (absolute_pass || relative_pass) &&
+                  (duty_x1000 >= IR_PROFILE_RECOVERY_DUTY_X1000);
+    if (window_pass) {
+        if (profile->recovery_pass_windows <
+            IR_PROFILE_RECOVERY_CONFIRM_WINDOWS) {
+            profile->recovery_pass_windows++;
+        }
+    } else {
+        profile->recovery_pass_windows = 0U;
+    }
+
+    if (profile->recovery_pass_windows >=
+        IR_PROFILE_RECOVERY_CONFIRM_WINDOWS) {
         profile->state = IR_PROFILE_SUSTAINED;
         profile->low_power_accum_ms = 0U;
-        DBG("T%lu PROFILE LIGHTER -> SUSTAINED MEAN=%lu R1000=%lu DUTY1000=%lu PEAK=%lu",
+        DBG("T%lu PROFILE LIGHTER -> SUSTAINED MEAN=%lu RMIN=%lu R1000=%lu ABS=%u REL=%u DUTY1000=%lu HIT=%u/%u PEAK=%lu",
             (unsigned long)now, (unsigned long)valid_mean,
-            (unsigned long)ratio_x1000, (unsigned long)duty_x1000,
+            (unsigned long)IR_PROFILE_RECOVERY_POWER_MIN,
+            (unsigned long)ratio_x1000,
+            (unsigned int)absolute_pass, (unsigned int)relative_pass,
+            (unsigned long)duty_x1000,
+            (unsigned int)profile->recovery_pass_windows,
+            (unsigned int)IR_PROFILE_RECOVERY_CONFIRM_WINDOWS,
             (unsigned long)profile->early_peak);
     } else {
-        DBG("T%lu PROFILE recovery pending MEAN=%lu R1000=%lu DUTY1000=%lu VALID=%u/%u",
+        DBG("T%lu PROFILE recovery pending MEAN=%lu RMIN=%lu R1000=%lu ABS=%u REL=%u DUTY1000=%lu HIT=%u/%u VALID=%u/%u",
             (unsigned long)now, (unsigned long)valid_mean,
-            (unsigned long)ratio_x1000, (unsigned long)duty_x1000,
+            (unsigned long)IR_PROFILE_RECOVERY_POWER_MIN,
+            (unsigned long)ratio_x1000,
+            (unsigned int)absolute_pass, (unsigned int)relative_pass,
+            (unsigned long)duty_x1000,
+            (unsigned int)profile->recovery_pass_windows,
+            (unsigned int)IR_PROFILE_RECOVERY_CONFIRM_WINDOWS,
             (unsigned int)profile->late_high_samples,
             (unsigned int)profile->late_samples);
     }
@@ -1095,30 +1144,39 @@ static void ignition_profile_recover_sustained(IR_Detector_t *d,
     profile->late_sum = 0U;
     profile->late_samples = 0U;
     profile->late_high_samples = 0U;
+    if (profile->state == IR_PROFILE_SUSTAINED) {
+        profile->recovery_pass_windows = 0U;
+    }
 }
 
 /**
   @brief  使用当前已收集数据结束本次点火包络观察
   @param  d: 检测器实例
   @param  now: 当前毫秒tick
-  @param  fire_deadline: 0=完整3.5秒窗口到期，1=WARNING已具备FIRE条件而提前收口
+  @param  fire_ready: 0=峰值窗+最大稳定窗到期，1=WARNING已具备FIRE条件而提前收口
 
-  仅当本次观察已经进入过WARNING时才允许提交分类。正常情况下观察满3.5秒后
-  调用；如果WARNING证据先达到confirm_ms，则必须在
+  仅当本次观察已经进入过WARNING时才允许提交分类。正常情况下峰值窗1.5秒加
+  稳定窗最多1.5秒；如果WARNING证据先达到confirm_ms，则必须在
   进入FIRE前调用，保证日志和报警顺序始终是PROFILE result在前、FIRE在后。
 
-  提前收口仍使用已经获得的0~2.5秒峰值及2.5秒后的稳定段样本。高灵敏度下可能
-  尚未进入稳定段，此时late_samples为0，无法可靠识别快速衰减，按SUSTAINED
-  放行报警。这是高灵敏度允许更多误报的明确降级策略，不会因为数据不足漏报。
- */
+  提前收口使用0~1.5秒峰值窗及其后已经实际取得的全部稳定段样本，不要求补满
+  1.5秒稳定窗。高灵敏度下FIRE_READY可能早于稳定窗，此时late_samples为0，
+  无法可靠识别快速衰减，按SUSTAINED放行报警；不会为了分类延迟正常报警。
+  */
 static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
-                                    uint8_t fire_deadline)
+                                    uint8_t fire_ready)
 {
     IR_Profile_t *profile = &d->profile;
+#if defined(AP_ALGO_DEBUG_ENABLE)
     uint32_t observe_ms = now - profile->phase_start_ms;
+    uint32_t late_ms = (uint32_t)profile->late_samples *
+                       IR_PROCESS_STEP_MS;
+#endif
     uint32_t late_mean;
     uint32_t ratio_x1000;
+#if defined(AP_ALGO_DEBUG_ENABLE)
     uint32_t duty_x1000;
+#endif
 
     /*
      * 没有进入过WARNING的包络只属于预采集数据，不能提交成LIGHTER或
@@ -1136,13 +1194,15 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
     ratio_x1000 = (profile->early_peak == 0U) ? 1000U
         : (uint32_t)(((uint64_t)late_mean * 1000U) /
                      profile->early_peak);
+#if defined(AP_ALGO_DEBUG_ENABLE)
     duty_x1000 = ignition_profile_duty_x1000(
         profile->late_high_samples, profile->late_samples);
+#endif
 
     /*
-     * 打火机分类必须同时满足固定的24万峰值门槛、至少一个OFF以上有效后段样本、
-     * 以及LATE/PEAK<40%。24万用于排除此前2万级的小启动沿；它不是火焰进场
-     * 阈值，也不随灵敏度变化。无有效后段数据时不能用低于OFF的样本证明衰减，
+     * 打火机分类必须同时满足固定峰值门槛（当前10万）、至少一个OFF以上有效
+     * 后段样本，以及LATE/PEAK<40%。该门槛不是火焰进场阈值，也不随灵敏度
+     * 变化。无有效后段数据时不能用低于OFF的样本证明衰减，
      * 按SUSTAINED放行，优先避免真实火焰漏报。
      */
     if (profile->early_peak >= IR_PROFILE_LIGHTER_PEAK_MIN &&
@@ -1154,7 +1214,7 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
     }
 
 #if defined(AP_ALGO_DEBUG_ENABLE)
-    DBG("T%lu PROFILE result=%s PEAK=%lu PMIN=%lu LATE=%lu R1000=%lu DUTY1000=%lu VALID=%u/%u OBS=%lu MODE=%s",
+    DBG("T%lu PROFILE result=%s PEAK=%lu PMIN=%lu LATE=%lu R1000=%lu DUTY1000=%lu VALID=%u/%u LATE_MS=%lu OBS=%lu MODE=%s",
         (unsigned long)now, ir_profile_name(profile->state),
         (unsigned long)profile->early_peak,
         (unsigned long)IR_PROFILE_LIGHTER_PEAK_MIN,
@@ -1162,8 +1222,12 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
         (unsigned long)ratio_x1000, (unsigned long)duty_x1000,
         (unsigned int)profile->late_high_samples,
         (unsigned int)profile->late_samples,
+        (unsigned long)late_ms,
         (unsigned long)observe_ms,
-        (fire_deadline != 0U) ? "FIRE_READY" : "FULL");
+        (fire_ready != 0U) ? "FIRE_READY" : "FULL");
+#else
+    (void)now;
+    (void)fire_ready;
 #endif
 
     /*
@@ -1183,14 +1247,14 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
   @param  now: 当前毫秒tick
 
   初次观察分为互不重叠的两个区间：
-    - 0~2.5秒：持续记录从首次跨过ON开始的early_peak，覆盖打火机完整起峰；
-    - 2.5~3.5秒：累计衰减后的late_mean和P45>=OFF的late_duty。
+    - 0~1.5秒：持续记录从首次跨过ON开始的early_peak，覆盖打火机完整起峰；
+    - 1.5~3.0秒：最多累计1.5秒late_mean和P45>=OFF的late_duty。
 
   P45本身已经是0.5秒滚动均方值，因此early_peak不是ADC单点毛刺。按照现场
-  特征，仅当PEAK>=24万、有OFF以上有效后段样本且late/peak<40%时标记为
+  特征，仅当PEAK达到固定门槛、有OFF以上有效后段样本且late/peak<40%时标记为
   LIGHTER，其他情况标记为SUSTAINED。低于OFF的样本不参与late均值，只进入
   late_duty分母。若WARNING先达到确认时间，则在FIRE迁移前使用已有数据提前
-  结束观察。LIGHTER后续按1秒窗口检查有效能量，满足恢复幅度与占空比后只允许
+  结束稳定窗，采到多少稳定样本就使用多少。LIGHTER后续按1秒窗口检查有效能量，满足恢复幅度与占空比后只允许
   单向升级为SUSTAINED；两种状态均在P45低于OFF满2秒后回BYPASS重新布防。
  */
 static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
@@ -1199,27 +1263,8 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
     uint32_t power = d->feat[IR_CH_MAIN].power_x1000; /* 当前P45：0.5秒滚动均方值 */
     uint32_t elapsed = now - profile->phase_start_ms; /* 当前阶段已运行时间，单位ms */
 
-    /*
-     * 热启动兜底：
-     * 设备上电时火焰可能已经存在，或旧事件释放后火焰仍在剧烈波动，此时P45无法
-     * 连续低于OFF满1秒，PROFILE会停留在BYPASS而得不到完整“安静->点火”包络。
-     * 只有正常IR五判据已经独立推动状态机进入WARNING/FIRE时，才将该事件接纳为
-     * SUSTAINED。该路径不修改valid_accum_ms，也不绕过五判据、确认时长或UV确认；
-     * 它仅补齐缺少冷启动沿时的包络状态，避免BYPASS长期悬空。
-     */
-    if (profile->state == IR_PROFILE_BYPASS &&
-        (d->state == IR_STATE_WARNING || d->state == IR_STATE_FIRE)) {
-        memset(profile, 0, sizeof(*profile));
-        profile->state = IR_PROFILE_SUSTAINED;
-        profile->phase_start_ms = now;
-        DBG("T%lu PROFILE BYPASS -> SUSTAINED REASON=HOT_START IR=%s P=%lu",
-            (unsigned long)now, ir_state_name(d->state),
-            (unsigned long)power);
-        return;
-    }
-
     if (profile->state == IR_PROFILE_ARMED) {
-        /* 只认布防后的第一次ON上穿沿，该时刻作为3.5秒观察窗口的t=0。 */
+        /* 只认布防后的第一次ON上穿沿，该时刻作为最长3秒观察窗口的t=0。 */
         if (power >= d->power_threshold) {
             ignition_profile_start(d, now, power);  /* 从布防到观察 */
         }
@@ -1245,10 +1290,10 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
         }
 
         /*
-         * 阶段1，t=[0,2.5s)：只更新P45最大值。即使P45首次超过ON后继续升高，
+         * 阶段1，t=[0,1.5s)：只更新P45最大值。即使P45首次超过ON后继续升高，
          * early_peak也会跟随更新，因此不会把第一次过阈值值误当成峰值。
          */
-        if (elapsed < IR_PROFILE_PEAK_END_MS) {
+        if (elapsed < IR_PROFILE_PEAK_WINDOW_MS) {
             if (power > profile->early_peak) {
                 profile->early_peak = power;    /* 动态更新峰值 */
             }
@@ -1256,10 +1301,12 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
         }
 
         /*
-         * 阶段2，t=[2.5s,3.5s)：峰值已经锁定，独立统计后期稳定能量。
+         * 阶段2，t=[1.5s,3.0s)：峰值已经锁定，最多统计1.5秒后期稳定能量。
          * late_samples记录窗口总样本数；只有P45>=OFF时才写入late_sum并增加
          * late_high_samples。LATE使用有效样本数作分母，低于OFF的低谷不会
          * 参与均值；总样本数仍保留用于输出有效时间占比DUTY1000。
+         * WARNING若在本区间内先满足FIRE条件，由ignition_profile_allows_fire()
+         * 立即使用当前已采样本收口，不会等待IR_PROFILE_OBSERVE_END_MS。
          */
         if (elapsed >= IR_PROFILE_LATE_START_MS &&
             elapsed < IR_PROFILE_OBSERVE_END_MS) {
@@ -1300,6 +1347,40 @@ static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
 
     /* BYPASS独立等待安静布防，不依赖当前IR处于IDLE、WARNING还是FIRE。 */
     ignition_profile_arm_if_quiet(d, power);
+}
+
+/**
+  @brief  在正常IR判据当周期有效时接纳缺少冷启动沿的持续火焰
+  @param  d: 检测器实例
+  @param  now: 当前毫秒tick
+  @param  power: 当前4.5um滚动均方值
+
+  设备上电时火焰可能已经存在，或旧事件释放后火焰仍在波动，PROFILE因无法取得
+  P45<OFF连续1秒的安静背景而停留在BYPASS。该场景没有可用于打火机分类的完整
+  启动沿，因此当正常IR状态机在本周期确认P45>=ON且光谱/频率判据全部通过时，
+  直接把PROFILE接纳为SUSTAINED。
+
+  本函数只能从正常IR判据通过的分支调用，不能仅根据上周期遗留的WARNING状态
+  调用。这样LIGHTER刚释放而WARNING尚未完成掉线超时时，即使PROFILE已是BYPASS，
+  P45很低或当前判据无效也不会误触发热启动。
+  */
+static void ignition_profile_accept_hot_start(IR_Detector_t *d,
+                                               uint32_t now,
+                                               uint32_t power)
+{
+    IR_Profile_t *profile = &d->profile;
+
+    if (profile->state != IR_PROFILE_BYPASS ||
+        power < d->power_threshold) {
+        return;
+    }
+
+    memset(profile, 0, sizeof(*profile));
+    profile->state = IR_PROFILE_SUSTAINED;
+    profile->phase_start_ms = now;
+    DBG("T%lu PROFILE BYPASS -> SUSTAINED REASON=HOT_START IR=%s P=%lu",
+        (unsigned long)now, ir_state_name(d->state),
+        (unsigned long)power);
 }
 
 /**
@@ -1551,6 +1632,11 @@ static void AP_IR_Process(uint32_t now)
                 if (power >= s_ir.power_threshold && check_entry_criteria(&s_ir)) {
                     s_ir.state = IR_STATE_WARNING;
                     /*
+                     * 若PROFILE因没有安静背景仍在BYPASS，本次新鲜的五判据进场
+                     * 证据可将其作为热启动持续火焰接纳，不需要伪造点火包络。
+                     */
+                    ignition_profile_accept_hot_start(&s_ir, now, power);
+                    /*
                      * PROFILE本周期已经先执行，必须在状态迁移点同步标记，
                      * 防止下一周期前的边界处理误把有效候选当成无WARNING瞬态。
                      */
@@ -1569,11 +1655,21 @@ static void AP_IR_Process(uint32_t now)
 
             case IR_STATE_WARNING:
                 if (warning_power_available(&s_ir, now)) {
+                    bool criteria_ok = warning_criteria_available(&s_ir, now);
+
                     /*
                      * IR证据积分只由功率、光谱和频率判据决定。PROFILE可能同时
                      * 处于ARMED/OBS/LIGHTER/SUSTAINED，但不会暂停或清除该积分。
+                     * 若旧分类已释放到BYPASS，必须等当前功率重新达到ON且本周期
+                     * 判据通过后才接纳热启动，不能读取遗留WARNING状态直接迁移。
                      */
-                    if (warning_criteria_available(&s_ir, now) &&
+                    if (criteria_ok) {
+                        ignition_profile_accept_hot_start(
+                            &s_ir, now,
+                            s_ir.feat[IR_CH_MAIN].power_x1000);
+                    }
+
+                    if (criteria_ok &&
                         s_ir.valid_accum_ms >= s_ir.confirm_ms &&
                         ignition_profile_allows_fire(&s_ir, now)) {
                         s_ir.state = IR_STATE_FIRE;

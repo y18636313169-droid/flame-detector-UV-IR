@@ -9,15 +9,19 @@
   *            →50点DC/功率+200点ZCR+光谱比→五判据串联
   *            →IR报警状态机
   *          同时，P45首次跨过门槛独立启动点火包络分类：
-  *            2.5秒峰值+1秒OFF以上有效均值→LIGHTER/SUSTAINED
+  *            1.5秒峰值+最多1.5秒OFF以上有效均值→LIGHTER/SUSTAINED
   *          包络分类与WARNING证据积分并行；若证据先满足，则在进入FIRE前
-  *          使用已有数据提前分类。仅PEAK≥24万且late/peak<40%才判LIGHTER；
-  *          LIGHTER阻止FIRE，但后续能量持续恢复时可单向升级为SUSTAINED。
+  *          立即使用已采稳定样本提前分类，不要求稳定窗补满。仅PEAK≥10万
+  *          且late/peak<40%才判LIGHTER；
+  *          LIGHTER阻止FIRE；后续每1秒统计一次有效平均能量，单窗满足
+  *          (均值≥5万 OR 恢复至启动峰值40%)且有效占比≥60%，连续2窗
+  *          通过后单向升级为SUSTAINED。
   *          SUSTAINED禁止反向降级，分类数据不足时按放行处理。
   *          若观察期间从未进入WARNING且P45低于OFF满1秒，则丢弃该短瞬态并
   *          直接重新ARMED，不生成分类终态。
-  *          若火焰已存在且持续波动导致BYPASS无法安静布防，正常IR状态机进入
-  *          WARNING/FIRE后按热启动接纳为SUSTAINED，不绕过原五判据和确认积分。
+  *          若火焰已存在且持续波动导致BYPASS无法安静布防，仅在当周期P45达到
+  *          ON且正常IR光谱/频率判据通过时按热启动接纳为SUSTAINED；
+  *          不读取掉线尾段遗留的旧WARNING，也不绕过原五判据和确认积分。
   *
   *          == 参数存储(EEPROM) ==
   *          4.5um进场功率与确认时长以 min/max 范围存储，等级0~9线性插值。

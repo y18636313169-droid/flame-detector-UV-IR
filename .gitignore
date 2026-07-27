@@ -34,3 +34,6 @@ build/
 # === EIDE 模板 ===
 *.ept
 *.eide-template
+
+# === codex生成文件 ===
+.codex_tmp/
