@@ -66,6 +66,8 @@
 static volatile uint8_t  test_print_pending;    /* 10ms 测试打印标志 */
 static uint8_t           ir_print_enabled;      /* IR ADC 打印开关 */
 static uint8_t           uv_print_enabled;      /* UV 脉冲打印开关 */
+#else
+static uint8_t           show_mode_enabled;     /* 1: 演示模式仅用UV报警，由EEPROM恢复 */
 #endif
 
 /* USER CODE END PV */
@@ -106,6 +108,40 @@ void TEST_SetUvEnabled(uint8_t en) { uv_print_enabled = en; }
 uint8_t TEST_GetUvEnabled(void) { return uv_print_enabled; }
 
 void TEST_InsertMarker(const char *msg) { test_print_marker(msg); }
+
+#else
+
+int APP_SetShowMode(uint8_t en)
+{
+    uint8_t next_mode = (en != 0U) ? 1U : 0U;
+
+    if (show_mode_enabled == next_mode) {
+        return 0;
+    }
+
+    AP_EEPROM_System_Param_t config = *AP_EEPROM_System_Get();
+    config.show_mode = next_mode;
+    /*
+     * 命令切换属于低频操作，允许在主循环写DATA EEPROM。
+     * 必须先保存成功再切换运行状态，防止RAM模式与掉电配置不一致。
+     */
+    if (AP_EEPROM_System_Save(&config) != 0) {
+        return -1;
+    }
+
+    show_mode_enabled = next_mode;
+    /*
+     * 演示模式暂停IR任务。进入和退出时均清空IR状态、滤波器及历史窗口，
+     * 防止恢复双传感器判断后使用切换前的旧FIRE状态或过期特征。
+     */
+    AP_IR_Reset();
+    return 0;
+}
+
+uint8_t APP_GetShowMode(void)
+{
+    return show_mode_enabled;
+}
 
 #endif /* IR_TEST_MODE */
 
@@ -164,7 +200,10 @@ int main(void)
   uv_print_enabled = 0;   /* 默认关闭 */
   BSP_UART_Printf("[TEST] IR_TEST_MODE enabled — type 'debug on' to start\r\n");
 #else
-  BSP_UART_Printf("NORMAL START!\r\n");
+  /* EEPROM已完成CRC和取值校验，上电直接恢复断电前的演示/正常模式。 */
+  show_mode_enabled = (uint8_t)AP_EEPROM_System_Get()->show_mode;
+  BSP_UART_Printf("NORMAL START! SHOW_MODE=%s\r\n",
+                  show_mode_enabled ? "on" : "off");
 #endif
   /* USER CODE END 2 */
 
@@ -200,21 +239,29 @@ int main(void)
     /*  正常模式: 紫外检测 + 红外检测 + 双重确认                          */
     /* ================================================================ */
     AP_UV_Task();
-    AP_IR_Task();
+    /*
+     * 演示模式仅推进UV状态机以缩短演示报警时间；IR定时中断仍只置单bit标志，
+     * 不会形成采样积压，退出演示模式时由APP_SetShowMode()重新清空IR上下文。
+     */
+    if (!APP_GetShowMode()) {
+        AP_IR_Task();
+    }
 
-    /* 双重确认: UV && IR 同时触发 → 火警上报 */
+    /* 正常模式要求UV&&IR；演示模式只要求UV，演示开关不改变各传感器内部算法。 */
     {
         static uint8_t last_fire = 0;
+        uint8_t show_mode = APP_GetShowMode();
         uint8_t now_fire = (AP_UV_GetState() == UV_STATE_FIRE)
-                        && (AP_IR_GetState() == IR_STATE_FIRE);
+                        && (show_mode || (AP_IR_GetState() == IR_STATE_FIRE));
         if (now_fire && !last_fire) {
             BSP_ALARM_Set();              // 硬件报警输出 (ALM1+ALM2 低)
             // uint8_t data = 1;
             // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
 #if defined(AP_ALGO_DEBUG_ENABLE)
             /* 仅记录最终组合报警沿，便于区分单传感器FIRE与实际输出报警。 */
-            BSP_UART_Printf("[ALARM] T%lu ON UV=%u IR=%u\r\n",
+            BSP_UART_Printf("[ALARM] T%lu ON MODE=%s UV=%u IR=%u\r\n",
                             (unsigned long)HAL_GetTick(),
+                            show_mode ? "SHOW" : "NORMAL",
                             (unsigned int)AP_UV_GetState(),
                             (unsigned int)AP_IR_GetState());
 #endif
@@ -223,8 +270,9 @@ int main(void)
             // uint8_t data = 0;
             // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
 #if defined(AP_ALGO_DEBUG_ENABLE)
-            BSP_UART_Printf("[ALARM] T%lu OFF UV=%u IR=%u\r\n",
+            BSP_UART_Printf("[ALARM] T%lu OFF MODE=%s UV=%u IR=%u\r\n",
                             (unsigned long)HAL_GetTick(),
+                            show_mode ? "SHOW" : "NORMAL",
                             (unsigned int)AP_UV_GetState(),
                             (unsigned int)AP_IR_GetState());
 #endif

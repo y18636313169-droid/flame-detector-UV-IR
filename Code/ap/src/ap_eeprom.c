@@ -39,6 +39,7 @@
 static AP_EEPROM_ADC_Param_t s_adc;
 static AP_EEPROM_UV_Param_t  s_uv;
 static AP_EEPROM_IR_Param_t  s_ir;   /* 3 路 IR 检测参数 */
+static AP_EEPROM_System_Param_t s_system;
 
 /*
  * v6只保存一个固定进场功率。保留旧布局用于一次性迁移，避免升级固件时
@@ -69,6 +70,9 @@ typedef char IR_V6_LayoutMustRemain60Bytes[
     (sizeof(AP_EEPROM_IR_V6_Param_t) == 60U) ? 1 : -1];
 typedef char IR_V7_LayoutMustFitOneSector[
     (sizeof(AP_EEPROM_IR_Param_t) <= EEPROM_SECTOR_SIZE) ? 1 : -1];
+typedef char SystemLayoutMustFitOneSector[
+    ((sizeof(AP_EEPROM_System_Param_t) <= EEPROM_SECTOR_SIZE) &&
+     ((sizeof(AP_EEPROM_System_Param_t) % sizeof(uint32_t)) == 0U)) ? 1 : -1];
 
 /* ========================================================================== */
 /*                         默认值回调                                          */
@@ -123,6 +127,16 @@ static void ir_defaults(void *buf)
     p->zcr_dead_zone[2] = AP_EEPROM_IR_DEFAULT_DZ_50;
 }
 
+static void system_defaults(void *buf)
+{
+    AP_EEPROM_System_Param_t *p = (AP_EEPROM_System_Param_t *)buf;
+    memset(p, 0, sizeof(*p));
+    p->magic     = EEPROM_SYSTEM_MAGIC;
+    p->version   = 1U;
+    p->length    = sizeof(*p);
+    p->show_mode = AP_EEPROM_SYSTEM_DEFAULT_SHOW_MODE;
+}
+
 /** @brief 校验ADC参数，防止超过12位ADC有效范围。 */
 static int adc_params_valid(const AP_EEPROM_ADC_Param_t *p)
 {
@@ -168,6 +182,14 @@ static int ir_params_valid(const AP_EEPROM_IR_Param_t *p)
         if (p->zcr_dead_zone[ch] < PARAM_IR_DEAD_ZONE_MIN ||
             p->zcr_dead_zone[ch] > PARAM_IR_DEAD_ZONE_MAX) return 0;
     }
+    return 1;
+}
+
+/** @brief 系统运行模式只允许正常模式0或演示模式1，拒绝损坏或越界值。 */
+static int system_params_valid(const AP_EEPROM_System_Param_t *p)
+{
+    if (p->version != 1U || p->length != sizeof(*p)) return 0;
+    if (p->show_mode > 1U) return 0;
     return 1;
 }
 
@@ -288,6 +310,24 @@ int AP_EEPROM_Init(void)
         }
     }
 
+    /*
+     * 系统模式使用独立扇区，避免修改已有ADC/UV/IR结构导致现场参数失效。
+     * 旧固件未写过该扇区时自动建立默认正常模式，之后由show命令持久化。
+     */
+    if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_SYSTEM, &s_system, sizeof(s_system),
+                              EEPROM_SYSTEM_MAGIC, system_defaults,
+                              CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) {
+        ret = -1;
+    }
+    if (!system_params_valid(&s_system)) {
+        system_defaults(&s_system);
+        if (BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &s_system,
+                                  sizeof(s_system),
+                                  CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) {
+            ret = -1;
+        }
+    }
+
     return ret;
 }
 
@@ -376,4 +416,40 @@ int AP_EEPROM_IR_Reset(void)
     ir_defaults(&s_ir);
     return BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
                                   IR_CRC_OFFSET);
+}
+
+/* ---- System ---- */
+
+const AP_EEPROM_System_Param_t *AP_EEPROM_System_Get(void)
+{
+    return &s_system;
+}
+
+int AP_EEPROM_System_Save(const AP_EEPROM_System_Param_t *p)
+{
+    if (p == NULL) return -1;
+
+    /*
+     * 先校验并写入候选副本，Flash写入成功后才提交RAM配置；
+     * 这样掉电存储失败不会造成当前模式和持久化模式不一致。
+     */
+    AP_EEPROM_System_Param_t candidate = *p;
+    candidate.magic = EEPROM_SYSTEM_MAGIC;
+    candidate.version = 1U;
+    candidate.length = sizeof(candidate);
+    if (!system_params_valid(&candidate)) return -1;
+
+    int ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &candidate,
+                                    sizeof(candidate),
+                                    CRC_OFF(AP_EEPROM_System_Param_t, crc16));
+    if (ret == 0) s_system = candidate;
+    return ret;
+}
+
+int AP_EEPROM_System_Reset(void)
+{
+    system_defaults(&s_system);
+    return BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &s_system,
+                                 sizeof(s_system),
+                                 CRC_OFF(AP_EEPROM_System_Param_t, crc16));
 }

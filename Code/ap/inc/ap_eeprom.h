@@ -29,6 +29,7 @@ extern "C" {
 #define EEPROM_SECTOR_ADC   (EEPROM_BASE + 0 * EEPROM_SECTOR_SIZE)   /* 0x08080000 */
 #define EEPROM_SECTOR_UV    (EEPROM_BASE + 1 * EEPROM_SECTOR_SIZE)   /* 0x08080040 */
 #define EEPROM_SECTOR_IR    (EEPROM_BASE + 2 * EEPROM_SECTOR_SIZE)   /* 0x08080080 */
+#define EEPROM_SECTOR_SYSTEM (EEPROM_BASE + 3 * EEPROM_SECTOR_SIZE)  /* 0x080800C0 */
 
 /* ========================================================================== */
 /*                         1. ADC 参数                                         */
@@ -110,8 +111,25 @@ typedef struct {
 } AP_EEPROM_IR_Param_t;
 
 /* ========================================================================== */
+/*                         4. 系统运行参数                                     */
+/* ========================================================================== */
+
+#define EEPROM_SYSTEM_MAGIC 0x45535931UL       /* "ESY1" - version 1 */
+
+typedef struct {
+    uint32_t    magic;
+    uint32_t    version;            /* 1 */
+    uint32_t    length;
+    uint32_t    show_mode;          /* 0: UV&&IR正常模式，1: 仅UV演示模式 */
+    uint16_t    crc16;
+    uint16_t    _pad;
+} AP_EEPROM_System_Param_t;
+
+/* ========================================================================== */
 /*                        默认值宏                                              */
 /* ========================================================================== */
+
+#define AP_EEPROM_SYSTEM_DEFAULT_SHOW_MODE 0U
 
 #define AP_EEPROM_UV_DEFAULT_SENS      5U
 #define AP_EEPROM_UV_DEFAULT_THR_MIN   5U
@@ -159,6 +177,11 @@ int  AP_EEPROM_UV_Reset(void);
 const AP_EEPROM_IR_Param_t  *AP_EEPROM_IR_Get(void);
 int  AP_EEPROM_IR_Save(const AP_EEPROM_IR_Param_t *p);
 int  AP_EEPROM_IR_Reset(void);
+
+/* ---- System ---- */
+const AP_EEPROM_System_Param_t *AP_EEPROM_System_Get(void);
+int  AP_EEPROM_System_Save(const AP_EEPROM_System_Param_t *p);
+int  AP_EEPROM_System_Reset(void);
 
 #ifdef __cplusplus
 }

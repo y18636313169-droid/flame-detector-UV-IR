@@ -60,6 +60,9 @@ uint8_t TEST_GetIrEnabled(void);
 void TEST_SetUvEnabled(uint8_t en);
 uint8_t TEST_GetUvEnabled(void);
 void TEST_InsertMarker(const char *msg);
+#else
+int APP_SetShowMode(uint8_t en);
+uint8_t APP_GetShowMode(void);
 #endif
 
 /* USER CODE END EFP */

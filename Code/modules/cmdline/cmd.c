@@ -49,6 +49,8 @@ static void cmd_mark(int argc, char **argv);
 static void cmd_led(int argc, char **argv);
 #if defined(IR_TEST_MODE)
 static void cmd_uart(int argc, char **argv);
+#else
+static void cmd_show(int argc, char **argv);
 #endif
 static void cmd_unknown(int argc, char **argv);
 
@@ -74,6 +76,8 @@ static const cmd_entry_t cmd_table[] = {
     {"led",    cmd_led},
 #if defined(IR_TEST_MODE)
     {"uart",   cmd_uart},
+#else
+    {"show",   cmd_show},
 #endif /* IR_TEST_MODE */
 
     {NULL,     cmd_unknown},
@@ -168,6 +172,8 @@ static void cmd_help(int argc, char **argv)
 #if defined(IR_TEST_MODE)
     CMD_PRINTF("  uart loop <n>            — COM loopback test, send N bytes\r\n");
     CMD_PRINTF("  uart recv                — print received COM data on DBG\r\n");
+#else
+    CMD_PRINTF("  show mode [on|off]       — persistent UV-only demonstration mode\r\n");
 #endif
 }
 
@@ -639,6 +645,43 @@ static void cmd_adc(int argc, char **argv)
 }
 
 /* ========================================================================== */
+/*                         show — 演示模式                                     */
+/* ========================================================================== */
+
+#if !defined(IR_TEST_MODE)
+static void cmd_show(int argc, char **argv)
+{
+    if ((argc == 1) || ((argc == 2) && (strcmp(argv[1], "mode") == 0))) {
+        CMD_PRINTF("show mode=%s (%s)\r\n",
+            APP_GetShowMode() ? "on" : "off",
+            APP_GetShowMode() ? "UV only" : "UV && IR");
+        return;
+    }
+
+    if ((argc == 3) && (strcmp(argv[1], "mode") == 0)) {
+        if (strcmp(argv[2], "on") == 0) {
+            if (APP_SetShowMode(1U) != 0) {
+                CMD_PRINTF("show mode save failed\r\n");
+                return;
+            }
+            CMD_PRINTF("show mode=on (UV only, saved)\r\n");
+            return;
+        }
+        if (strcmp(argv[2], "off") == 0) {
+            if (APP_SetShowMode(0U) != 0) {
+                CMD_PRINTF("show mode save failed\r\n");
+                return;
+            }
+            CMD_PRINTF("show mode=off (UV && IR, saved)\r\n");
+            return;
+        }
+    }
+
+    CMD_PRINTF("Usage: show mode [on|off]\r\n");
+}
+#endif
+
+/* ========================================================================== */
 /*                         状态命令                                            */
 /* ========================================================================== */
 
@@ -655,6 +698,10 @@ static void cmd_state(int argc, char **argv)
     AP_UV_GetParams(&uv_thr, &uv_win, &uv_cfm, &uv_clr);
 
     CMD_PRINTF("System state (uptime=%lums):\r\n", (unsigned long)tick);
+#if !defined(IR_TEST_MODE)
+    CMD_PRINTF("  Mode: %s\r\n",
+        APP_GetShowMode() ? "SHOW (UV only)" : "NORMAL (UV && IR)");
+#endif
     CMD_PRINTF("  UV: st=%u lv=%lu thr=%lu win=%lu cfm=%lu clr=%lu\r\n",
         (unsigned)AP_UV_GetState(),
         (unsigned long)uv->sensitivity, (unsigned long)uv_thr,
