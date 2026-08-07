@@ -38,6 +38,7 @@ static uint8_t cmd_index = 0;
 typedef void (*cmd_handler_t)(int argc, char **argv);
 
 static void cmd_help(int argc, char **argv);
+static void cmd_gpio(int argc, char **argv);
 static void cmd_adc(int argc, char **argv);
 static void cmd_uv(int argc, char **argv);
 static void cmd_ir(int argc, char **argv);
@@ -65,6 +66,7 @@ typedef struct {
 
 static const cmd_entry_t cmd_table[] = {
     {"help",   cmd_help},
+    {"gpio",   cmd_gpio},
     {"adc",    cmd_adc},
     {"uv",     cmd_uv},
     {"ir",     cmd_ir},
@@ -184,6 +186,58 @@ static void cmd_help(int argc, char **argv)
 
 static void cmd_param_uv(int argc, char **argv);
 static void cmd_param_ir(int argc, char **argv);
+
+
+/* ========================================================================== */
+/*                         gpio — GPIO 读写                                   */
+/* ========================================================================== */
+
+static void cmd_gpio(int argc, char **argv)
+{
+    if (argc < 4) {
+        CMD_PRINTF("Usage:\r\n");
+        CMD_PRINTF("  gpio write <port> <pin> <0/1>             — set pin\r\n");
+        CMD_PRINTF("  gpio read <port> <pin>                    — read pin\r\n");
+        CMD_PRINTF("  gpio toggle <port> <pin>                  — toggle pin\r\n");
+        CMD_PRINTF("  port: A/B/C/D/E/F/G/H (GPIOA~H)\r\n");
+        CMD_PRINTF("  pin:  0-15\r\n");
+        return;
+    }
+
+    GPIO_TypeDef *port;
+    char port_char = argv[2][0] | 0x20; /* to lower */
+    if (port_char == 'a') port = GPIOA;
+    else if (port_char == 'b') port = GPIOB;
+    else if (port_char == 'c') port = GPIOC;
+    else if (port_char == 'd') port = GPIOD;
+    else if (port_char == 'e') port = GPIOE;
+    else if (port_char == 'f') port = GPIOF;
+    else if (port_char == 'g') port = GPIOG;
+    else if (port_char == 'h') port = GPIOH;
+    else { CMD_PRINTF("gpio: invalid port '%s'\r\n", argv[2]); return; }
+
+    uint16_t pin = (uint16_t)(1 << atoi(argv[3]));
+    if (pin == 0 || atoi(argv[3]) > 15) {
+        CMD_PRINTF("gpio: invalid pin %s\r\n", argv[3]);
+        return;
+    }
+
+    if (strcmp(argv[1], "write") == 0 && argc >= 5) {
+        bool state = (atoi(argv[4]) != 0);
+        HAL_GPIO_WritePin(port, pin, state);
+        CMD_PRINTF("gpio: %c%d=%s\r\n", port_char - 0x20, atoi(argv[3]),
+            state ? "HIGH" : "LOW");
+    } else if (strcmp(argv[1], "read") == 0) {
+        bool val = HAL_GPIO_ReadPin(port, pin);
+        CMD_PRINTF("gpio: %c%d=%s\r\n", port_char - 0x20, atoi(argv[3]),
+            val ? "HIGH" : "LOW");
+    } else if (strcmp(argv[1], "toggle") == 0) {
+        HAL_GPIO_TogglePin(port, pin);
+        CMD_PRINTF("gpio: %c%d toggled\r\n", port_char - 0x20, atoi(argv[3]));
+    } else {
+        CMD_PRINTF("gpio: check 'help gpio'\r\n");
+    }
+}
 
 static void cmd_param(int argc, char **argv)
 {
