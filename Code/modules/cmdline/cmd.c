@@ -48,11 +48,10 @@ static void cmd_reset(int argc, char **argv);
 static void cmd_debug(int argc, char **argv);
 static void cmd_mark(int argc, char **argv);
 static void cmd_led(int argc, char **argv);
-#if defined(IR_TEST_MODE)
 static void cmd_uart(int argc, char **argv);
-#else
 static void cmd_show(int argc, char **argv);
-#endif
+static void cmd_test(int argc, char **argv);
+static void cmd_profile(int argc, char **argv);
 static void cmd_unknown(int argc, char **argv);
 
 /* ========================================================================== */
@@ -76,11 +75,10 @@ static const cmd_entry_t cmd_table[] = {
     {"debug",  cmd_debug},
     {"mark",   cmd_mark},
     {"led",    cmd_led},
-#if defined(IR_TEST_MODE)
     {"uart",   cmd_uart},
-#else
     {"show",   cmd_show},
-#endif /* IR_TEST_MODE */
+    {"test",   cmd_test},
+    {"profile", cmd_profile},
 
     {NULL,     cmd_unknown},
 };
@@ -171,12 +169,11 @@ static void cmd_help(int argc, char **argv)
     CMD_PRINTF("  led work <ms>            — set LED heartbeat interval\r\n");
     CMD_PRINTF("  led blink <n> <ms>       — LED blink N times at interval\r\n");
     CMD_PRINTF("  led stop                 — stop LED, turn off\r\n");
-#if defined(IR_TEST_MODE)
+    CMD_PRINTF("  test mode [on|off]       — persistent runtime test mode\r\n");
+    CMD_PRINTF("  show mode [on|off]       — persistent UV-only demonstration mode\r\n");
+    CMD_PRINTF("  profile [on|off]         — persistent IR ignition-profile switch\r\n");
     CMD_PRINTF("  uart loop <n>            — COM loopback test, send N bytes\r\n");
     CMD_PRINTF("  uart recv                — print received COM data on DBG\r\n");
-#else
-    CMD_PRINTF("  show mode [on|off]       — persistent UV-only demonstration mode\r\n");
-#endif
 }
 
 /* ========================================================================== */
@@ -702,7 +699,6 @@ static void cmd_adc(int argc, char **argv)
 /*                         show — 演示模式                                     */
 /* ========================================================================== */
 
-#if !defined(IR_TEST_MODE)
 static void cmd_show(int argc, char **argv)
 {
     if ((argc == 1) || ((argc == 2) && (strcmp(argv[1], "mode") == 0))) {
@@ -733,7 +729,82 @@ static void cmd_show(int argc, char **argv)
 
     CMD_PRINTF("Usage: show mode [on|off]\r\n");
 }
-#endif
+
+/* ========================================================================== */
+/*                         test — 运行时测试模式                               */
+/* ========================================================================== */
+
+static void cmd_test(int argc, char **argv)
+{
+    if ((argc == 1) || ((argc == 2) && (strcmp(argv[1], "mode") == 0))) {
+        CMD_PRINTF("test mode=%s\r\n", APP_GetTestMode() ? "on" : "off");
+        return;
+    }
+
+    if ((argc == 3) && (strcmp(argv[1], "mode") == 0)) {
+        uint8_t enable;
+        if (strcmp(argv[2], "on") == 0) {
+            enable = 1U;
+        } else if (strcmp(argv[2], "off") == 0) {
+            enable = 0U;
+        } else {
+            CMD_PRINTF("Usage: test mode [on|off]\r\n");
+            return;
+        }
+
+        if (APP_SetTestMode(enable) != 0) {
+            CMD_PRINTF("test mode save failed\r\n");
+            return;
+        }
+        CMD_PRINTF("test mode=%s (saved)%s\r\n",
+            enable ? "on" : "off",
+            enable ? "; use 'debug on' to print data" : "");
+        return;
+    }
+
+    CMD_PRINTF("Usage: test mode [on|off]\r\n");
+}
+
+/* ========================================================================== */
+/*                         profile — 红外点火包络分类开关                      */
+/* ========================================================================== */
+
+static void cmd_profile(int argc, char **argv)
+{
+    if ((argc == 1) || ((argc == 2) && (strcmp(argv[1], "mode") == 0))) {
+        CMD_PRINTF("profile=%s (%s)\r\n",
+            APP_GetIrProfileEnabled() ? "on" : "off",
+            APP_GetIrProfileEnabled() ? "lighter rejection enabled"
+                                      : "lighter rejection bypassed");
+        return;
+    }
+
+    const char *value = (argc == 2) ? argv[1]
+                       : ((argc == 3 && strcmp(argv[1], "mode") == 0)
+                          ? argv[2] : NULL);
+    if (value != NULL) {
+        uint8_t enable;
+        if (strcmp(value, "on") == 0) {
+            enable = 1U;
+        } else if (strcmp(value, "off") == 0) {
+            enable = 0U;
+        } else {
+            CMD_PRINTF("Usage: profile [mode] [on|off]\r\n");
+            return;
+        }
+
+        if (APP_SetIrProfileEnabled(enable) != 0) {
+            CMD_PRINTF("profile save failed\r\n");
+            return;
+        }
+        CMD_PRINTF("profile=%s (%s, saved)\r\n",
+            enable ? "on" : "off",
+            enable ? "lighter rejection enabled" : "lighter may alarm");
+        return;
+    }
+
+    CMD_PRINTF("Usage: profile [mode] [on|off]\r\n");
+}
 
 /* ========================================================================== */
 /*                         状态命令                                            */
@@ -752,10 +823,10 @@ static void cmd_state(int argc, char **argv)
     AP_UV_GetParams(&uv_thr, &uv_win, &uv_cfm, &uv_clr);
 
     CMD_PRINTF("System state (uptime=%lums):\r\n", (unsigned long)tick);
-#if !defined(IR_TEST_MODE)
-    CMD_PRINTF("  Mode: %s\r\n",
-        APP_GetShowMode() ? "SHOW (UV only)" : "NORMAL (UV && IR)");
-#endif
+    CMD_PRINTF("  Mode: %s, SHOW=%s, PROFILE=%s\r\n",
+        APP_GetTestMode() ? "TEST" : "APP",
+        APP_GetShowMode() ? "on (UV only)" : "off (UV && IR)",
+        APP_GetIrProfileEnabled() ? "on" : "off");
     CMD_PRINTF("  UV: st=%u lv=%lu thr=%lu win=%lu cfm=%lu clr=%lu\r\n",
         (unsigned)AP_UV_GetState(),
         (unsigned long)uv->sensitivity, (unsigned long)uv_thr,
@@ -792,7 +863,13 @@ static void cmd_reset(int argc, char **argv)
 
 static void cmd_debug(int argc, char **argv)
 {
-#if defined(IR_TEST_MODE)
+    if (!APP_GetTestMode()) {
+        (void)argc;
+        (void)argv;
+        CMD_PRINTF("debug: enable 'test mode on' first\r\n");
+        return;
+    }
+
     if (argc < 2) {
         CMD_PRINTF("debug ir=%s uv=%s ir_win=%lums\r\n",
             TEST_GetIrEnabled() ? "on" : "off",
@@ -838,11 +915,6 @@ static void cmd_debug(int argc, char **argv)
             CMD_PRINTF("Usage: debug [ir|uv] on|off\r\n");
         }
     }
-#else
-    (void)argc;
-    (void)argv;
-    CMD_PRINTF("debug: only available in IR_TEST_MODE\r\n");
-#endif
 }
 
 /* ========================================================================== */
@@ -851,14 +923,12 @@ static void cmd_debug(int argc, char **argv)
 
 static void cmd_mark(int argc, char **argv)
 {
-#if defined(IR_TEST_MODE)
+    if (!APP_GetTestMode()) {
+        CMD_PRINTF("mark: enable 'test mode on' first\r\n");
+        return;
+    }
     const char *msg = (argc > 1) ? argv[1] : NULL;
     TEST_InsertMarker(msg);
-#else
-    (void)argc;
-    (void)argv;
-    CMD_PRINTF("mark: only available in IR_TEST_MODE\r\n");
-#endif
 }
 
 /* ========================================================================== */
@@ -897,9 +967,12 @@ static void cmd_led(int argc, char **argv)
 /* ========================================================================== */
 /*                         uart — 串口通信测试                                 */
 /* ========================================================================== */
-#if defined(IR_TEST_MODE)
 static void cmd_uart(int argc, char **argv)
 {
+    if (!APP_GetTestMode()) {
+        CMD_PRINTF("uart: enable 'test mode on' first\r\n");
+        return;
+    }
     if (argc < 2) {
         CMD_PRINTF("Usage: uart loop <n> | recv\r\n");
         return;
@@ -933,7 +1006,6 @@ static void cmd_uart(int argc, char **argv)
         CMD_PRINTF("Usage: uart loop <n> | recv\r\n");
     }
 }
-#endif
 /* ========================================================================== */
 /*                         未知命令                                             */
 /* ========================================================================== */

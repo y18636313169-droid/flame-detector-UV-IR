@@ -60,7 +60,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "ap_util.h"        /* for IR_TEST_MODE */
+#include "ap_util.h"
 
 /* ========================================================================== */
 /*                          常量宏                                             */
@@ -200,7 +200,6 @@ int AP_IR_StartZcrCalibration(void);
 void AP_IR_CancelZcrCalibration(void);
 /** @brief 查询手动标定进度及当前生效死区。 */
 void AP_IR_GetZcrCalibrationStatus(AP_IR_ZcrCalStatus_t *status);
-#if defined(IR_TEST_MODE)
 /**
   * @brief  测试模式: 执行完整信号处理链，打印中间结果，不进状态机
   *         每 100Hz 调用一次，输出行格式:
@@ -223,7 +222,10 @@ uint32_t AP_IR_TestGetAvgWindowMs(void);
   * @param  now: HAL_GetTick()
   */
 void AP_IR_DebugProcess(uint32_t now);
-#endif /* IR_TEST_MODE */
+
+/** @brief 运行时启停点火包络分类；关闭时不再以LIGHTER阻止IR报警。 */
+void AP_IR_SetProfileEnabled(uint8_t enabled);
+uint8_t AP_IR_GetProfileEnabled(void);
 
 #ifdef __cplusplus
 }

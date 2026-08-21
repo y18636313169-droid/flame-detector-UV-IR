@@ -62,13 +62,12 @@
 /* USER CODE BEGIN PV */
 
 /* ISR → 主循环标志 (ISR 只置位, 主循环消费) */
-#if defined(IR_TEST_MODE)
 static volatile uint8_t  test_print_pending;    /* 10ms 测试打印标志 */
 static uint8_t           ir_print_enabled;      /* IR ADC 打印开关 */
 static uint8_t           uv_print_enabled;      /* UV 脉冲打印开关 */
-#else
 static uint8_t           show_mode_enabled;     /* 1: 演示模式仅用UV报警，由EEPROM恢复 */
-#endif
+static uint8_t           test_mode_enabled;     /* 1: 运行时测试模式，不执行报警算法 */
+static uint8_t           alarm_output_active;   /* 最终ALM输出沿状态，模式切换时同步清零 */
 
 /* USER CODE END PV */
 
@@ -80,8 +79,6 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-#if defined(IR_TEST_MODE)
 
 /**
   * @brief  100Hz: ADC→去直流→均方值
@@ -108,8 +105,6 @@ void TEST_SetUvEnabled(uint8_t en) { uv_print_enabled = en; }
 uint8_t TEST_GetUvEnabled(void) { return uv_print_enabled; }
 
 void TEST_InsertMarker(const char *msg) { test_print_marker(msg); }
-
-#else
 
 int APP_SetShowMode(uint8_t en)
 {
@@ -143,7 +138,52 @@ uint8_t APP_GetShowMode(void)
     return show_mode_enabled;
 }
 
-#endif /* IR_TEST_MODE */
+int APP_SetTestMode(uint8_t en)
+{
+    uint8_t next_mode = (en != 0U) ? 1U : 0U;
+    if (test_mode_enabled == next_mode) return 0;
+
+    AP_EEPROM_System_Param_t config = *AP_EEPROM_System_Get();
+    config.test_mode = next_mode;
+    /* 与演示模式一致，必须先持久化成功再改变主循环执行路径。 */
+    if (AP_EEPROM_System_Save(&config) != 0) return -1;
+
+    test_mode_enabled = next_mode;
+    /*
+     * 测试/应用算法使用不同的数据推进方式。切换时清空两套检测上下文和
+     * 硬件报警，防止测试历史、旧FIRE状态或脉冲队列跨模式继续生效。
+     */
+    AP_IR_Reset();
+    AP_UV_Process_Reset();
+    BSP_ALARM_Reset();
+    alarm_output_active = 0U;
+    test_print_pending = 0U;
+    return 0;
+}
+
+uint8_t APP_GetTestMode(void)
+{
+    return test_mode_enabled;
+}
+
+int APP_SetIrProfileEnabled(uint8_t en)
+{
+    uint8_t next = (en != 0U) ? 1U : 0U;
+    if (AP_IR_GetProfileEnabled() == next) return 0;
+
+    AP_EEPROM_System_Param_t config = *AP_EEPROM_System_Get();
+    config.ir_profile_enabled = next;
+    if (AP_EEPROM_System_Save(&config) != 0) return -1;
+
+    /* EEPROM成功后再清理并切换包络分类器，保持掉电配置与当前行为一致。 */
+    AP_IR_SetProfileEnabled(next);
+    return 0;
+}
+
+uint8_t APP_GetIrProfileEnabled(void)
+{
+    return AP_IR_GetProfileEnabled();
+}
 
 /* USER CODE END 0 */
 
@@ -193,34 +233,33 @@ int main(void)
   AP_ADC_Init();
   AP_UART_ProtocolInit();
 
-  /* ISR → 主循环标志初始化 */
-#if defined(IR_TEST_MODE)
-  test_print_pending = 0;
-  ir_print_enabled = 0;
-  uv_print_enabled = 0;   /* 默认关闭 */
-  BSP_UART_Printf("[TEST] IR_TEST_MODE enabled — type 'debug on' to start\r\n");
-#else
-  /* EEPROM已完成CRC和取值校验，上电直接恢复断电前的演示/正常模式。 */
-  show_mode_enabled = (uint8_t)AP_EEPROM_System_Get()->show_mode;
-  BSP_UART_Printf("NORMAL START! SHOW_MODE=%s\r\n",
-                  show_mode_enabled ? "on" : "off");
-#endif
+  /* EEPROM已完成CRC/范围校验，运行模式和包络开关均恢复断电前配置。 */
+  const AP_EEPROM_System_Param_t *system_config = AP_EEPROM_System_Get();
+  test_print_pending = 0U;
+  ir_print_enabled = 0U;
+  uv_print_enabled = 0U;
+  alarm_output_active = 0U;
+  show_mode_enabled = (uint8_t)system_config->show_mode;
+  test_mode_enabled = (uint8_t)system_config->test_mode;
+  AP_IR_SetProfileEnabled((uint8_t)system_config->ir_profile_enabled);
+  BSP_UART_Printf("START MODE=%s SHOW=%s PROFILE=%s\r\n",
+                  test_mode_enabled ? "TEST" : "APP",
+                  show_mode_enabled ? "on" : "off",
+                  APP_GetIrProfileEnabled() ? "on" : "off");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-#if !defined(IR_TEST_MODE) /* 测试模式下不进行串口通信 使用命令行指令测试通信串口收发 */
     // AP_UART_TxTask(); // 串口通信TX任务
     // AP_UART_RxTask(); // 串口通信RX任务
-#endif /* IR_TEST_MODE */
 
     cmd_parser_task(); // 命令行解析
 
-#if defined(IR_TEST_MODE)
-    /* 测试模式: IR 打印由 test_print_pending 触发 */
-    if (test_print_pending) {
+    if (APP_GetTestMode()) {
+      /* 运行时测试模式: 仅定时采集/打印，不推进UV/IR报警状态机。 */
+      if (test_print_pending) {
         test_print_pending = 0;
         if (ir_print_enabled) {
             test_print_data();
@@ -233,27 +272,26 @@ int main(void)
                 AP_UV_PrintData(HAL_GetTick());
             }
         }
-    }
-#else
-    /* ================================================================ */
-    /*  正常模式: 紫外检测 + 红外检测 + 双重确认                          */
-    /* ================================================================ */
-    AP_UV_Task();
-    /*
-     * 演示模式仅推进UV状态机以缩短演示报警时间；IR定时中断仍只置单bit标志，
-     * 不会形成采样积压，退出演示模式时由APP_SetShowMode()重新清空IR上下文。
-     */
-    if (!APP_GetShowMode()) {
-        AP_IR_Task();
-    }
+      }
+    } else {
+      /* ================================================================ */
+      /*  应用模式: 紫外检测 + 红外检测 + 最终组合确认                     */
+      /* ================================================================ */
+      AP_UV_Task();
+      /*
+       * 演示模式仅推进UV状态机以缩短演示报警时间；IR定时中断仍只置单bit标志，
+       * 不会形成采样积压，退出演示模式时由APP_SetShowMode()重新清空IR上下文。
+       */
+      if (!APP_GetShowMode()) {
+          AP_IR_Task();
+      }
 
-    /* 正常模式要求UV&&IR；演示模式只要求UV，演示开关不改变各传感器内部算法。 */
-    {
-        static uint8_t last_fire = 0;
+      /* 正常模式要求UV&&IR；演示模式只要求UV，演示开关不改变传感器内部算法。 */
+      {
         uint8_t show_mode = APP_GetShowMode();
         uint8_t now_fire = (AP_UV_GetState() == UV_STATE_FIRE)
                         && (show_mode || (AP_IR_GetState() == IR_STATE_FIRE));
-        if (now_fire && !last_fire) {
+        if (now_fire && !alarm_output_active) {
             BSP_ALARM_Set();              // 硬件报警输出 (ALM1+ALM2 低)
             // uint8_t data = 1;
             // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
@@ -265,7 +303,7 @@ int main(void)
                             (unsigned int)AP_UV_GetState(),
                             (unsigned int)AP_IR_GetState());
 #endif
-        } else if (!now_fire && last_fire) {
+        } else if (!now_fire && alarm_output_active) {
             BSP_ALARM_Reset();            // 硬件报警解除 (ALM1+ALM2 高)
             // uint8_t data = 0;
             // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
@@ -277,9 +315,9 @@ int main(void)
                             (unsigned int)AP_IR_GetState());
 #endif
         }
-        last_fire = now_fire;
+        alarm_output_active = now_fire;
+      }
     }
-#endif /* IR_TEST_MODE */
 
     BSP_IWDG_CheckAndRefresh();   // 检查标志位并喂狗
     /* USER CODE END WHILE */
@@ -349,9 +387,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 void task_10ms(void)
 {
   AP_IR_FeedIsr();        // 仅置位 volatile 标志 (极轻量)
-#if defined(IR_TEST_MODE)
   test_print_pending = 1; // 主循环消费, 执行 test_print_data()
-#endif
 }
 
 /**

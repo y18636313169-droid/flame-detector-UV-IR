@@ -83,14 +83,12 @@ void AP_UV_SetLevel(uint8_t level);
 void AP_UV_SetPrintWindow(uint32_t ms);
 uint32_t AP_UV_GetPrintWindow(void);
 
-#if defined(IR_TEST_MODE)
 /**
   * @brief  测试模式：打印过去 print_window_ms 内的 UV 脉冲
   *         (脉宽列表，超时的脉冲会被自动移除)
   * @param  now: HAL_GetTick()
   */
 void AP_UV_PrintData(uint32_t now);
-#endif
 
 void AP_UV_Process_Reset(void);
 UV_DetectorState_t AP_UV_GetState(void);

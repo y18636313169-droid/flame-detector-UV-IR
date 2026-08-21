@@ -31,6 +31,9 @@
 #define EEPROM_IR_LEGACY_V6_MAGIC   (0x45495236UL)
 #define EEPROM_IR_LEGACY_V6_VERSION (6U)
 #define EEPROM_IR_VERSION           (7U)
+#define EEPROM_SYSTEM_LEGACY_V1_MAGIC   (0x45535931UL)
+#define EEPROM_SYSTEM_LEGACY_V1_VERSION (1U)
+#define EEPROM_SYSTEM_VERSION           (2U)
 
 /* ========================================================================== */
 /*                         内部变量                                            */
@@ -40,6 +43,16 @@ static AP_EEPROM_ADC_Param_t s_adc;
 static AP_EEPROM_UV_Param_t  s_uv;
 static AP_EEPROM_IR_Param_t  s_ir;   /* 3 路 IR 检测参数 */
 static AP_EEPROM_System_Param_t s_system;
+
+/* 系统参数v1只保存演示模式；升级到v2时必须保留该掉电配置。 */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t length;
+    uint32_t show_mode;
+    uint16_t crc16;
+    uint16_t _pad;
+} AP_EEPROM_System_V1_Param_t;
 
 /*
  * v6只保存一个固定进场功率。保留旧布局用于一次性迁移，避免升级固件时
@@ -73,6 +86,8 @@ typedef char IR_V7_LayoutMustFitOneSector[
 typedef char SystemLayoutMustFitOneSector[
     ((sizeof(AP_EEPROM_System_Param_t) <= EEPROM_SECTOR_SIZE) &&
      ((sizeof(AP_EEPROM_System_Param_t) % sizeof(uint32_t)) == 0U)) ? 1 : -1];
+typedef char SystemV1LayoutMustRemain20Bytes[
+    (sizeof(AP_EEPROM_System_V1_Param_t) == 20U) ? 1 : -1];
 
 /* ========================================================================== */
 /*                         默认值回调                                          */
@@ -132,9 +147,11 @@ static void system_defaults(void *buf)
     AP_EEPROM_System_Param_t *p = (AP_EEPROM_System_Param_t *)buf;
     memset(p, 0, sizeof(*p));
     p->magic     = EEPROM_SYSTEM_MAGIC;
-    p->version   = 1U;
+    p->version   = EEPROM_SYSTEM_VERSION;
     p->length    = sizeof(*p);
     p->show_mode = AP_EEPROM_SYSTEM_DEFAULT_SHOW_MODE;
+    p->test_mode = AP_EEPROM_SYSTEM_DEFAULT_TEST_MODE;
+    p->ir_profile_enabled = AP_EEPROM_SYSTEM_DEFAULT_IR_PROFILE;
 }
 
 /** @brief 校验ADC参数，防止超过12位ADC有效范围。 */
@@ -185,12 +202,44 @@ static int ir_params_valid(const AP_EEPROM_IR_Param_t *p)
     return 1;
 }
 
-/** @brief 系统运行模式只允许正常模式0或演示模式1，拒绝损坏或越界值。 */
+/** @brief 三个系统开关均只允许0/1，拒绝损坏或越界的持久化配置。 */
 static int system_params_valid(const AP_EEPROM_System_Param_t *p)
 {
-    if (p->version != 1U || p->length != sizeof(*p)) return 0;
-    if (p->show_mode > 1U) return 0;
+    if (p->version != EEPROM_SYSTEM_VERSION || p->length != sizeof(*p)) return 0;
+    if (p->show_mode > 1U || p->test_mode > 1U ||
+        p->ir_profile_enabled > 1U) return 0;
     return 1;
+}
+
+/** @brief 校验旧v1系统参数及CRC，防止把随机EEPROM内容当作迁移源。 */
+static int system_v1_params_valid(AP_EEPROM_System_V1_Param_t *p)
+{
+    if (p->magic != EEPROM_SYSTEM_LEGACY_V1_MAGIC ||
+        p->version != EEPROM_SYSTEM_LEGACY_V1_VERSION ||
+        p->length != sizeof(*p) || p->show_mode > 1U) return 0;
+
+    uint16_t saved_crc = p->crc16;
+    p->crc16 = 0U;
+    uint16_t calc_crc = CRC16_CCITT((const uint8_t *)p, sizeof(*p));
+    p->crc16 = saved_crc;
+    return saved_crc == calc_crc;
+}
+
+/**
+  @brief  将系统参数v1迁移到v2，保留原演示模式并补充运行时测试/包络开关
+  @return 1: 已迁移；0: 不是有效v1；-1: EEPROM保存失败
+ */
+static int system_try_migrate_v1(void)
+{
+    AP_EEPROM_System_V1_Param_t old;
+    BSP_EEPROM_Read(EEPROM_SECTOR_SYSTEM, &old, sizeof(old));
+    if (!system_v1_params_valid(&old)) return 0;
+
+    system_defaults(&s_system);
+    s_system.show_mode = old.show_mode;
+    return (BSP_EEPROM_SaveSector(
+                EEPROM_SECTOR_SYSTEM, &s_system, sizeof(s_system),
+                CRC_OFF(AP_EEPROM_System_Param_t, crc16)) == 0) ? 1 : -1;
 }
 
 /** @brief 校验旧v6结构及其CRC，只有完整有效的数据才允许迁移。 */
@@ -312,19 +361,23 @@ int AP_EEPROM_Init(void)
 
     /*
      * 系统模式使用独立扇区，避免修改已有ADC/UV/IR结构导致现场参数失效。
-     * 旧固件未写过该扇区时自动建立默认正常模式，之后由show命令持久化。
+     * v1保留已有SHOW值并迁移；未写过该扇区时建立APP/PROFILE开启默认配置。
      */
-    if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_SYSTEM, &s_system, sizeof(s_system),
-                              EEPROM_SYSTEM_MAGIC, system_defaults,
-                              CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) {
+    int system_migration = system_try_migrate_v1();
+    if (system_migration < 0) {
         ret = -1;
-    }
-    if (!system_params_valid(&s_system)) {
-        system_defaults(&s_system);
-        if (BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &s_system,
-                                  sizeof(s_system),
+    } else if (system_migration == 0) {
+        if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_SYSTEM, &s_system,
+                                  sizeof(s_system), EEPROM_SYSTEM_MAGIC,
+                                  system_defaults,
                                   CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) {
             ret = -1;
+        }
+        if (!system_params_valid(&s_system)) {
+            system_defaults(&s_system);
+            if (BSP_EEPROM_SaveSector(
+                    EEPROM_SECTOR_SYSTEM, &s_system, sizeof(s_system),
+                    CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) ret = -1;
         }
     }
 
@@ -435,7 +488,7 @@ int AP_EEPROM_System_Save(const AP_EEPROM_System_Param_t *p)
      */
     AP_EEPROM_System_Param_t candidate = *p;
     candidate.magic = EEPROM_SYSTEM_MAGIC;
-    candidate.version = 1U;
+    candidate.version = EEPROM_SYSTEM_VERSION;
     candidate.length = sizeof(candidate);
     if (!system_params_valid(&candidate)) return -1;
 

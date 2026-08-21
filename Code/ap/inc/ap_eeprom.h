@@ -114,13 +114,15 @@ typedef struct {
 /*                         4. 系统运行参数                                     */
 /* ========================================================================== */
 
-#define EEPROM_SYSTEM_MAGIC 0x45535931UL       /* "ESY1" - version 1 */
+#define EEPROM_SYSTEM_MAGIC 0x45535932UL       /* "ESY2" - version 2 */
 
 typedef struct {
     uint32_t    magic;
-    uint32_t    version;            /* 1 */
+    uint32_t    version;            /* 2 */
     uint32_t    length;
     uint32_t    show_mode;          /* 0: UV&&IR正常模式，1: 仅UV演示模式 */
+    uint32_t    test_mode;          /* 0: 正常运行，1: 仅采集/打印测试数据 */
+    uint32_t    ir_profile_enabled; /* 0: 关闭点火包络分类，1: 开启 */
     uint16_t    crc16;
     uint16_t    _pad;
 } AP_EEPROM_System_Param_t;
@@ -130,6 +132,8 @@ typedef struct {
 /* ========================================================================== */
 
 #define AP_EEPROM_SYSTEM_DEFAULT_SHOW_MODE 0U
+#define AP_EEPROM_SYSTEM_DEFAULT_TEST_MODE 0U
+#define AP_EEPROM_SYSTEM_DEFAULT_IR_PROFILE 1U
 
 #define AP_EEPROM_UV_DEFAULT_SENS      5U
 #define AP_EEPROM_UV_DEFAULT_THR_MIN   5U

@@ -232,6 +232,7 @@ typedef struct {
     uint8_t             power_drop_active;    /* 避免tick=0作为无效哨兵 */
     uint8_t             criteria_drop_active; /* WARNING其余判据失效标志 */
     IR_Profile_t        profile;              /* 点火后功率包络及稳定占空比分类器 */
+    uint8_t             profile_enabled;      /* 0时跳过包络分类，不阻止正常IR判警 */
 
     /* 功率/确认时间范围及固定判据，由EEPROM加载。 */
     uint8_t     level;          /* 0~9 */
@@ -284,7 +285,6 @@ static uint32_t s_debug_last_snapshot_ms;
 static uint8_t  s_debug_window_ready;
 #endif
 
-#if defined(IR_TEST_MODE)
 #define IR_TEST_AVG_WINDOW_MS_DEFAULT  (10000UL)
 #define IR_TEST_AVG_WINDOW_MS_MIN      (100UL)
 #define IR_TEST_AVG_WINDOW_MS_MAX      (60000UL)
@@ -362,7 +362,6 @@ uint32_t AP_IR_TestGetAvgWindowMs(void)
 {
     return s_ir_test.window_ms;
 }
-#endif /* IR_TEST_MODE */
 
 /* ========================================================================== */
 /*                        内部辅助 — 状态名                                    */
@@ -422,7 +421,7 @@ static void debug_log_features(uint32_t now)
                        (s_ir.criteria_drop_active != 0U)),
         (unsigned int)reference_zcr_valid(&s_ir, IR_CH_REF_A),
         (unsigned int)reference_zcr_valid(&s_ir, IR_CH_REF_B),
-        ir_profile_name(s_ir.profile.state));
+        s_ir.profile_enabled ? ir_profile_name(s_ir.profile.state) : "OFF");
 }
 
 #define DBG_CRITERION(fmt, ...)                                                \
@@ -477,7 +476,6 @@ static uint16_t history_to_workbuf(const IR_History_t *h, int32_t *buf,
     return cnt;
 }
 
-#if defined(IR_TEST_MODE)
 static uint16_t history_raw_to_workbuf(const IR_History_t *h, int32_t *buf,
                                        uint16_t request_count)
 {
@@ -490,7 +488,6 @@ static uint16_t history_raw_to_workbuf(const IR_History_t *h, int32_t *buf,
     }
     return cnt;
 }
-#endif
 
 /* ========================================================================== */
 /*                        预处理函数                                           */
@@ -680,7 +677,6 @@ static int32_t iir_lowpass_20hz_sample(uint32_t ch, int32_t x0)
 /*                        特征提取函数                                         */
 /* ========================================================================== */
 
-#if defined(IR_TEST_MODE)
 /**
   @brief  计算均值 (DC 偏置)
   @param  buf: 原始信号 (int32_t)
@@ -695,7 +691,6 @@ static int32_t calc_mean(const int32_t *buf, uint16_t len)
     }
     return (int32_t)(sum / len);
 }
-#endif /* IR_TEST_MODE */
 
 /**
   @brief  计算平均功率，即去直流信号的均方值
@@ -1259,6 +1254,9 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
  */
 static void ignition_profile_update(IR_Detector_t *d, uint32_t now)
 {
+    /* 关闭后不维护观察/恢复状态，红外五判据状态机仍独立运行。 */
+    if (d->profile_enabled == 0U) return;
+
     IR_Profile_t *profile = &d->profile; /* 独立包络状态，不等同于IR报警状态 */
     uint32_t power = d->feat[IR_CH_MAIN].power_x1000; /* 当前P45：0.5秒滚动均方值 */
     uint32_t elapsed = now - profile->phase_start_ms; /* 当前阶段已运行时间，单位ms */
@@ -1368,6 +1366,8 @@ static void ignition_profile_accept_hot_start(IR_Detector_t *d,
                                                uint32_t now,
                                                uint32_t power)
 {
+    if (d->profile_enabled == 0U) return;
+
     IR_Profile_t *profile = &d->profile;
 
     if (profile->state != IR_PROFILE_BYPASS ||
@@ -1394,6 +1394,9 @@ static void ignition_profile_accept_hot_start(IR_Detector_t *d,
  */
 static bool ignition_profile_allows_fire(IR_Detector_t *d, uint32_t now)
 {
+    /* 包络关闭用于允许打火机演示，不能改变正常功率/光谱/频率确认条件。 */
+    if (d->profile_enabled == 0U) return true;
+
     if (d->profile.state == IR_PROFILE_OBSERVING) {
         /*
          * 本函数只会在WARNING证据已满足、准备进入FIRE时调用。显式置位可
@@ -1727,13 +1730,12 @@ void AP_IR_Init(void)
     s_debug_last_snapshot_ms = 0U;
     s_debug_window_ready = 0U;
 #endif
-#if defined(IR_TEST_MODE)
     memset(&s_ir_test, 0, sizeof(s_ir_test));
     s_ir_test.window_ms = IR_TEST_AVG_WINDOW_MS_DEFAULT;
     test_stats_reset(HAL_GetTick());
-#endif
     s_ir.state = IR_STATE_IDLE;
     s_ir.feed_pending = 0;
+    s_ir.profile_enabled = 1U; /* 默认保持正式算法行为，随后由系统EEPROM配置覆盖。 */
     ignition_profile_clear(&s_ir);
 
     /* 从EEPROM加载功率范围和固定判据，再计算当前等级运行参数。 */
@@ -1906,6 +1908,25 @@ IR_DetectorState_t AP_IR_GetState(void)
     return s_ir.state;
 }
 
+void AP_IR_SetProfileEnabled(uint8_t enabled)
+{
+    uint8_t next = (enabled != 0U) ? 1U : 0U;
+    if (s_ir.profile_enabled == next) return;
+
+    s_ir.profile_enabled = next;
+    /*
+     * 动态切换时丢弃旧包络结论。关闭后立即解除LIGHTER阻断；重新开启时
+     * 必须重新经过安静布防或热启动接纳，不能复用关闭前的峰值和稳定窗。
+     */
+    ignition_profile_clear(&s_ir);
+    DBG("PROFILE enabled=%u context reset", (unsigned int)next);
+}
+
+uint8_t AP_IR_GetProfileEnabled(void)
+{
+    return s_ir.profile_enabled;
+}
+
 void AP_IR_Reset(void)
 {
     s_ir.state = IR_STATE_IDLE;
@@ -2011,7 +2032,6 @@ void AP_IR_GetZcrCalibrationStatus(AP_IR_ZcrCalStatus_t *status)
     }
 }
 
-#if defined(IR_TEST_MODE)
 /* ========================================================================== */
 /**
   * @brief  测试模式: 读 ADC → 去直流 → 均方值
@@ -2101,4 +2121,3 @@ void AP_IR_DebugProcess(uint32_t now)
         (unsigned int)zcr_to_x10(zcr[2]),
         (unsigned long)r45_38, (unsigned long)r45_50);
 }
-#endif /* IR_TEST_MODE */

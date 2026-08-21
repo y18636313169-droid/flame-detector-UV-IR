@@ -379,7 +379,6 @@ void AP_UV_GetParams(uint32_t *threshold, uint32_t *window_ms,
     if (fire_timeout_ms) *fire_timeout_ms = uv_det.fire_timeout_ms;
 }
 
-#if defined(IR_TEST_MODE)
 void AP_UV_PrintData(uint32_t now)
 {
     BSP_TIM_PulseData_t pulses[128];
@@ -393,4 +392,3 @@ void AP_UV_PrintData(uint32_t now)
         BSP_UART_Printf("\r\n");
     }
 }
-#endif /* IR_TEST_MODE */
