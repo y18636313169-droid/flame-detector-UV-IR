@@ -68,6 +68,9 @@ static uint8_t           uv_print_enabled;      /* UV 脉冲打印开关 */
 static uint8_t           show_mode_enabled;     /* 1: 演示模式仅用UV报警，由EEPROM恢复 */
 static uint8_t           test_mode_enabled;     /* 1: 运行时测试模式，不执行报警算法 */
 static uint8_t           alarm_output_active;   /* 最终ALM输出沿状态，模式切换时同步清零 */
+static uint8_t           adc_fault_output_active; /* BUG输出沿状态，仅由ADC轨到轨故障驱动 */
+static volatile uint8_t  recover_irq_pending;   /* EXTI只锁存事件，主循环执行完整恢复 */
+static uint8_t           recover_low_latched;   /* Continuous low level triggers only once */
 
 /* USER CODE END PV */
 
@@ -86,6 +89,46 @@ void SystemClock_Config(void);
 static void test_print_data(void)
 {
     AP_IR_TestPrint(HAL_GetTick());
+}
+
+/**
+  * @brief  Consume an active-low RECOVER edge and clear all alarm states once.
+  * @note   EXTI latches even a pulse that has ended before the main loop runs.
+  *         A continuous low level triggers only once; it must return high
+  *         before another recovery is accepted. Algorithm and history reset
+  *         deliberately remain outside interrupt context.
+  */
+static void recover_input_task(void)
+{
+    if (recover_irq_pending == 0U) {
+        /* Returning high rearms the next falling edge after the current event. */
+        if (HAL_GPIO_ReadPin(UV_RECOVER_GPIO_Port, UV_RECOVER_Pin) != GPIO_PIN_RESET) {
+            recover_low_latched = 0U;
+        }
+        return;
+    }
+
+    recover_irq_pending = 0U;
+    if (recover_low_latched != 0U) {
+        return;
+    }
+
+    {
+        uint32_t now = HAL_GetTick();
+
+        /* Manual recovery clears sensor states and the final alarm output together. */
+        AP_IR_Reset();
+        AP_UV_Process_Reset();
+        BSP_ALARM_Reset();
+        alarm_output_active = 0U;
+        recover_low_latched = 1U;
+
+#if defined(AP_ALGO_DEBUG_ENABLE)
+        BSP_UART_Printf("[RECOVER] T%lu alarm states reset\r\n", (unsigned long)now);
+#else
+        (void)now;
+#endif
+    }
 }
 
 
@@ -149,6 +192,10 @@ int APP_SetTestMode(uint8_t en)
     if (AP_EEPROM_System_Save(&config) != 0) return -1;
 
     test_mode_enabled = next_mode;
+    if (next_mode == 0U) {
+        /* 离开测试模式时强制恢复USART2正式协议，防止诊断模式遗留导致失联。 */
+        AP_UART_SetDiagnosticMode(false);
+    }
     /*
      * 测试/应用算法使用不同的数据推进方式。切换时清空两套检测上下文和
      * 硬件报警，防止测试历史、旧FIRE状态或脉冲队列跨模式继续生效。
@@ -225,7 +272,9 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  BSP_BoardInit();
+  if (BSP_BoardInit() != BSP_BOARD_OK) {
+    Error_Handler();
+  }
 
   AP_EEPROM_Init();    // 加载 EEPROM 参数到内存
   AP_IR_Init();        // 从 EEPROM 加载参数并初始化红外检测
@@ -239,6 +288,9 @@ int main(void)
   ir_print_enabled = 0U;
   uv_print_enabled = 0U;
   alarm_output_active = 0U;
+  adc_fault_output_active = 0U;
+  recover_irq_pending = 0U;
+  recover_low_latched = 0U;
   show_mode_enabled = (uint8_t)system_config->show_mode;
   test_mode_enabled = (uint8_t)system_config->test_mode;
   AP_IR_SetProfileEnabled((uint8_t)system_config->ir_profile_enabled);
@@ -252,9 +304,31 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // AP_UART_TxTask(); // 串口通信TX任务
-    // AP_UART_RxTask(); // 串口通信RX任务
+    recover_input_task(); /* RECOVER low clears IR, UV and the final ALM state. */
 
+    /*
+     * USART2配置协议只在主循环执行：先消费已到达的DMA数据，再检查会话超时，
+     * 避免10s边界上已经到达的合法请求被误判为未建联。RX仍限制每轮32字节。
+     */
+    AP_UART_RxTask();
+    AP_UART_TxTask();
+    AP_UART_CheckTimeout();
+
+    /*
+     * BUG只表示红外ADC硬件级轨到轨故障，不承载初始化、通信或算法未通过状态。
+     * 监控在所有运行模式下执行，但不直接改变IR/UV火警状态。
+     */
+    {
+      uint8_t adc_fault = AP_ADC_FaultMonitorTask(HAL_GetTick());
+      if (adc_fault != adc_fault_output_active) {
+        if (adc_fault != 0U) {
+          BSP_FAULT_Set();       /* BUG低电平：任一ADC通道连续0/4095满10秒 */
+        } else {
+          BSP_FAULT_Reset();     /* BUG高电平：三通道连续恢复有效值满2秒 */
+        }
+        adc_fault_output_active = adc_fault;
+      }
+    }
     cmd_parser_task(); // 命令行解析
 
     if (APP_GetTestMode()) {
@@ -292,9 +366,7 @@ int main(void)
         uint8_t now_fire = (AP_UV_GetState() == UV_STATE_FIRE)
                         && (show_mode || (AP_IR_GetState() == IR_STATE_FIRE));
         if (now_fire && !alarm_output_active) {
-            BSP_ALARM_Set();              // 硬件报警输出 (ALM1+ALM2 低)
-            // uint8_t data = 1;
-            // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
+            BSP_ALARM_Set();              // Single ALM output: low means alarm
 #if defined(AP_ALGO_DEBUG_ENABLE)
             /* 仅记录最终组合报警沿，便于区分单传感器FIRE与实际输出报警。 */
             BSP_UART_Printf("[ALARM] T%lu ON MODE=%s UV=%u IR=%u\r\n",
@@ -304,9 +376,7 @@ int main(void)
                             (unsigned int)AP_IR_GetState());
 #endif
         } else if (!now_fire && alarm_output_active) {
-            BSP_ALARM_Reset();            // 硬件报警解除 (ALM1+ALM2 高)
-            // uint8_t data = 0;
-            // AP_UART_Send(AP_FCODE_FIRE_ALARM, &data, 1);
+            BSP_ALARM_Reset();            // Return single ALM output high (idle)
 #if defined(AP_ALGO_DEBUG_ENABLE)
             BSP_UART_Printf("[ALARM] T%lu OFF MODE=%s UV=%u IR=%u\r\n",
                             (unsigned long)HAL_GetTick(),
@@ -384,6 +454,17 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     BSP_TIM_IC_CaptureHandler(htim);
 }
 
+/**
+  * @brief  Latch the active-low RECOVER falling edge for the main loop.
+  * @note   Do not reset detector histories or print from EXTI context.
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == UV_RECOVER_Pin) {
+    recover_irq_pending = 1U;
+  }
+}
+
 void task_10ms(void)
 {
   AP_IR_FeedIsr();        // 仅置位 volatile 标志 (极轻量)
@@ -402,7 +483,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
     if (htim->Instance == TIM6) {
         cnt_task ++;
-        // AP_UART_CheckTimeout();
         if (cnt_task % 10 == 0)
         {
           task_10ms();
@@ -425,7 +505,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* Fatal MCU/software errors are not mapped to BUG; BUG is reserved for ADC rail faults. */
   __disable_irq();
   while (1)
   {

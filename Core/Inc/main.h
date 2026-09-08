@@ -75,10 +75,13 @@ uint8_t APP_GetIrProfileEnabled(void);
 #define IR_OUT_2_GPIO_Port GPIOC
 #define IR_OUT_1_Pin GPIO_PIN_2
 #define IR_OUT_1_GPIO_Port GPIOC
-#define ALM2_Pin GPIO_PIN_0
-#define ALM2_GPIO_Port GPIOA
-#define ALM1_Pin GPIO_PIN_1
-#define ALM1_GPIO_Port GPIOA
+#define UV_RECOVER_Pin GPIO_PIN_3
+#define UV_RECOVER_GPIO_Port GPIOC
+#define UV_RECOVER_EXTI_IRQn EXTI3_IRQn
+#define ALM_Pin GPIO_PIN_0
+#define ALM_GPIO_Port GPIOA
+#define BUG_Pin GPIO_PIN_1
+#define BUG_GPIO_Port GPIOA
 #define CHK_MODE_Pin GPIO_PIN_2
 #define CHK_MODE_GPIO_Port GPIOB
 #define LED_Pin GPIO_PIN_6

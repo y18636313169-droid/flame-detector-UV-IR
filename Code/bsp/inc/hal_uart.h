@@ -62,10 +62,14 @@ int  BSP_UART_DeInit(BSP_UART_Id_t id);
 uint16_t BSP_UART_Write(BSP_UART_Id_t id, const uint8_t *data, uint16_t len);
 int      BSP_UART_WriteBlock(BSP_UART_Id_t id, const uint8_t *data, uint16_t len, uint32_t timeout_ms);
 bool     BSP_UART_IsTxComplete(BSP_UART_Id_t id);
+/** @brief 查询并清除TX DMA故障锁存标志。 */
+bool     BSP_UART_TxFaulted(BSP_UART_Id_t id);
 
 /* ---- 接收（从 RX 中断环形缓冲读取）--------------------------------------- */
 uint16_t BSP_UART_Read(BSP_UART_Id_t id, uint8_t *buf, uint16_t len);
 uint16_t BSP_UART_GetRxDataLen(BSP_UART_Id_t id);
+/** @brief 查询并清除RX DMA覆盖或串口接收错误标志。 */
+bool     BSP_UART_RxOverflowed(BSP_UART_Id_t id);
 
 /* ---- Peek / Consume ----------------------------------------------------- */
 bool     BSP_UART_Peek(BSP_UART_Id_t id, void *out, uint16_t offset);

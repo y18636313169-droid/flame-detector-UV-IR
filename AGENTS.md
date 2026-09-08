@@ -38,9 +38,9 @@ fire_source_identification/
 │   ├── ap/                        # 应用层
 │   │   ├── inc/
 │   │   │   ├── ap_adc.h           # ADC DMA 启动 + 原始值读取
-│   │   │   ├── ap_util.h          # 工具函数(lerp) + IR_TEST_MODE 开关
+│   │   │   ├── ap_util.h          # 工具函数(lerp) + 算法调试日志宏
 │   │   │   ├── ap_eeprom.h        # 参数分组(ADC/UV/IR) + 默认值 + 掉电保存
-│   │   │   ├── ap_uart_protocol.h # 串口协议组包/解析/ACK
+│   │   │   ├── ap_uart_protocol.h # 树莓派配置协议、会话、去重与应答
 │   │   │   ├── ap_uv.h            # 紫外火焰检测（窗口计数+状态机）
 │   │   │   └── ap_ir.h            # 红外三波段多光谱融合检测（五判据+状态机）
 │   │   └── src/                   # 对应实现
@@ -61,7 +61,7 @@ stm32l1xx_it.c
   │           HAL_TIM_IC_CaptureCallback → BSP_TIM_IC_CaptureHandler   [hal_tim.c]
   │           HAL_TIM_PeriodElapsedCallback:
   │             ├── TIM5 → BSP_LED_TickHandler                         [hal_led.c]
-  │             ├── TIM6 → AP_UART_CheckTimeout() + task_10ms()        [main.c]
+  │             ├── TIM6 → task_10ms()                                 [main.c]
   │             │          task_10ms: 仅置位标志 (AP_IR_FeedIsr,       [main.c]
   │             │                    test_print_pending)
   │             └── TIM3 → BSP_TIM_IC_PeriodHandler                    [hal_tim.c]
@@ -96,15 +96,17 @@ stm32l1xx_it.c
 ### hal_uart.h — UART DMA 环形缓冲驱动
 | 函数 | 说明 |
 |------|------|
-| `BSP_UART_Init(id)` | 初始化串口（COM=USART1, DBG=USART2），启动 RX DMA 循环 |
+| `BSP_UART_Init(id)` | 初始化串口（COM=USART2, DBG=USART1），启动 RX DMA 循环 |
 | `BSP_UART_Write(id, data, len)` | 写入 TX 环形缓冲，DMA 自动搬运（非阻塞） |
 | `BSP_UART_WriteBlock(id, data, len, ms)` | 阻塞发送，带超时 |
 | `BSP_UART_Read(id, buf, len)` | 从 RX DMA 循环缓冲读取 |
 | `BSP_UART_GetRxDataLen(id)` | 查询 RX 缓冲可读数据长度 |
+| `BSP_UART_RxOverflowed(id)` | 查询并清除RX DMA覆盖或接收错误标志 |
 | `BSP_UART_Peek(id, out, offset)` | 查看 RX 缓冲指定偏移 1 字节（不移动读指针） |
 | `BSP_UART_PeekPacket(id, out, off, len)` | 查看 RX 缓冲一段连续数据 |
 | `BSP_UART_Consume(id, len)` | 推进 RX 读指针 |
 | `BSP_UART_IsTxComplete(id)` | 查询 TX 是否发送完成 |
+| `BSP_UART_TxFaulted(id)` | 查询并清除TX DMA故障锁存标志 |
 | `BSP_UART_Printf(fmt, ...)` | 通过 DBG 串口格式化打印 |
 
 ### hal_tim.h — TIM3 双通道脉宽捕获
@@ -174,8 +176,7 @@ stm32l1xx_it.c
 | 函数/宏 | 说明 |
 |---------|------|
 | `lerp_u32(min, max, level, levels)` | 无符号 32 位线性插值（static inline） |
-| `IR_TEST_MODE` | 测试模式开关宏（定义在 ap_util.h） |
-| `AP_ALGO_DEBUG_ENABLE` | 应用模式算法事件及500ms特征快照开关（默认关闭，不编译调试状态） |
+| `AP_ALGO_DEBUG_ENABLE` | 应用模式算法事件及500ms特征快照编译开关 |
 
 ### ap_adc.h — ADC 原始值读取
 | 函数 | 说明 |
@@ -191,32 +192,20 @@ stm32l1xx_it.c
 | `AP_EEPROM_Init()` | 加载所有参数组（ADC/UV/IR），魔数+CRC校验，失败写默认值 |
 | `AP_EEPROM_ADC_Get/Save/Reset` | ADC 阈值参数存取 |
 | `AP_EEPROM_UV_Get/Save/Reset` | UV 检测参数存取（v3：灵敏度+3组min/max+脉宽/打印窗口） |
-| `AP_EEPROM_IR_Get/Save/Reset` | IR 多光谱融合参数存取（v7：功率min/max+固定光谱比/频率/ZCR死区+确认时间min/max，兼容迁移v6） |
+| `AP_EEPROM_IR_Get/Save/Reset` | IR 多光谱融合参数存取（v7：功率min/max+固定光谱比/FFT频带+确认时间min/max；保留旧ZCR字段以兼容v6/v7布局） |
 
 ### ap_uart_protocol.h — 串口通信协议
 | 函数 | 说明 |
 |------|------|
-| `AP_UART_ProtocolInit()` | 清 TX 缓冲，复位解析状态机 |
-| `AP_UART_Send(fcode, data, len)` | 发送一帧（SEQ 内部自增，默认需应答） |
-| `AP_UART_TxTask()` | TX 状态机：IDLE→SENDING→WAIT_ACK |
-| `AP_UART_RxTask()` | RX 状态机：三步入解析→CRC→FCode分发 |
-| `AP_UART_CheckTimeout()` | ACK 超时检查（TIM6 每 1ms 调用） |
-| `AP_UART_IsIdle()` | 查询 TX+RX 是否空闲 |
+| `AP_UART_ProtocolInit()` | 清解析器、响应发送器、会话和去重缓存 |
+| `AP_UART_RxTask()` | 有界读取 USART2 DMA 数据，每次最多处理一帧请求 |
+| `AP_UART_TxTask()` | 非阻塞推进单帧或双帧响应，兼容 TX 队列部分接收 |
+| `AP_UART_CheckTimeout()` | 主循环处理100ms半帧、500ms发送和10s会话超时 |
+| `AP_UART_IsIdle()` | 查询解析、响应队列和 USART2 物理发送是否均空闲 |
+| `AP_UART_SetDiagnosticMode()` | 测试模式下暂停/恢复USART2协议；切换时清会话和收发残留 |
+| `AP_UART_GetDiagnosticMode()` | 查询USART2是否处于原始诊断模式 |
 
-#### TX 状态机
-```
-IDLE:    tx_buf_check() → 非空且 entry_len 合法 → SENDING
-SENDING: tx_buf_pop() → SEQ++ → 组帧→CRC→发送 → WAIT_ACK
-WAIT_ACK: tx_ack_flag 被 RX 置位 → tx_buf_consume() → IDLE
-          CheckTimeout 超时 → 重传 / 丢弃
-```
-
-#### RX 状态机
-```
-STEP_STX:  Peek offset 0=STX → 匹配 → STEP_LEN（不 consume）
-STEP_LEN:  Peek offset 2=LEN → 合法性检查 → STEP_DATA
-STEP_DATA: PeekPacket 整帧 → CRC 校验 → ETX 检查 → Consume → process_rx_frame
-```
+协议采用严格停等：树莓派握手后逐项请求，从机完成校验和 EEPROM 写后读回才应答。最近一次请求及完整响应被缓存；相同请求只重放响应，不重复写 EEPROM，相同序号但内容不同或旧序号均拒绝执行。
 
 ### ap_uv.h — 紫外火焰检测
 | 函数 | 说明 |
@@ -243,40 +232,37 @@ IDLE ──(窗口计数≥threshold)──→ WARNING ──(有效累计≥con
 |------|------|
 | `AP_IR_Init()` | 从EEPROM加载参数，初始化历史窗口和状态机 |
 | `AP_IR_FeedIsr()` | ISR(TIM6)调用，仅置位 volatile 标志 |
-| `AP_IR_Feed()` | 从 ADC 读最新值，经连续IIR后推入200点历史窗口（不进状态机） |
+| `AP_IR_Feed()` | 从 ADC 读最新值，经连续IIR后推入256点历史窗口（不进状态机） |
 | `AP_IR_Task()` | 主循环调用，检查标志→Feed→Process(全流程检测) |
 | `AP_IR_SetLevel(level)` | 运行时调整等级0~9，仅插值确认时长 |
 | `AP_IR_GetState()` | 返回当前状态 IR_STATE_IDLE/WARNING/FIRE |
 | `AP_IR_Reset()` | 重置状态机到 IDLE，清历史窗口 |
-| `AP_IR_GetFeatures(power, zcr, &r45_38, &r45_50)` | 获取实时特征值（调试用） |
-| `AP_IR_GetZcrDeadZone(dead_zone)` | 获取从EEPROM加载的三通道固定ZCR死区 |
-| `AP_IR_StartZcrCalibration()` | 启动非阻塞手动死区标定（预热5秒+5个独立2秒窗口） |
-| `AP_IR_CancelZcrCalibration()` | 取消手动标定，不改变当前死区和EEPROM |
-| `AP_IR_GetZcrCalibrationStatus(status)` | 查询标定阶段、窗口进度、剩余时间和生效死区 |
+| `AP_IR_GetFeatures(power, dominant_freq, &r45_38, &r45_50)` | 获取功率、FFT主频和光谱比（调试用） |
 | `AP_IR_SetConfig(...)` | 设置进场功率范围、固定光谱比/频率及确认时间范围 |
 | `AP_IR_GetParams(...)` | 获取当前运行参数 |
 | `AP_IR_DebugProcess(now)` | 测试模式：信号链处理+打印，不进状态机 |
 
 #### 算法流程
 ```
-Feed(ADC值→每通道连续20Hz IIR→200点历史缓存) → ZCR窗口满后:
+Feed(ADC值→每通道连续20Hz IIR→256点历史缓存) → FFT窗口满后:
   最近50点 → 去直流(减均值) → 平均功率(P3.8/P4.5/P5.0，均方值)
-  最近200点 → 独立去直流 → 使用EEPROM固定死区计算过零率(ZCR3.8/ZCR4.5/ZCR5.0 Hz)
+  最近256点 → 独立去直流 + Hann窗 + Q30定点FFT（每100ms更新）
   → 光谱比(R4.5/3.8, R4.5/5.0 ×1000；参考功率仅在严格为0时比例置0)
   → 五判据串联:
       ① P4.5 ≥ 当前等级进场阈值12000~22000（退出阈值为当前值的40%）
       ② R4.5/3.8 > 光谱比阈值(高温热源鉴别)
       ③ R4.5/5.0 > 光谱比阈值(背景辐射鉴别)
-      ④ ZCR4.5 ∈ [1.0Hz, 20Hz] (闪烁频率验证)
-      ⑤ |ZCR4.5-ZCR3.8| < 2Hz 且 |ZCR4.5-ZCR5.0| < 2Hz (频率一致性)
+      ④ 在配置火焰频带内搜索4.5um FFT峰值主频
+      ⑤ 频带能量占比≥50%，1.5Hz以上核心能量占比≥15%，带内峰值≥全频最大峰值的50%
+      ⑥ 3.8/5.0um达到有效功率后，才要求其FFT主频与4.5um相差不超过2Hz
   → 五判据全部通过: IDLE→WARNING
   → P45安静布防后第一次跨过当前等级ON时，并行启动最长3秒主通道包络分类
       0~1.5秒: 持续记录0.5秒滚动均方值的启动最高峰early_peak
       1.5~3.0秒: 最多采1.5秒稳定数据，late_mean只统计P45≥当前OFF的有效样本
       WARNING证据先满足: FIRE迁移前立即使用当前已采稳定样本完成分类，不等待3秒终点
-      PEAK≥100000、有有效后段样本且late/peak<40%: 分类为LIGHTER并阻止FIRE
+      PEAK≥100000、有有效后段样本且late/peak<50%: 分类为LIGHTER并阻止FIRE
       其他情况或高灵敏度下后段数据不足: 分类为SUSTAINED并放行FIRE
-      LIGHTER后每1秒检查恢复；(均值≥50000 OR 恢复至PEAK的40%)且有效占比≥60%的连续2窗通过后升级
+      LIGHTER后每1秒检查恢复；有效占比≥60%后，相对路径(恢复至PEAK的30%)连续2窗或固定路径(均值≥50000)连续5窗通过后升级
       SUSTAINED禁止反向降级；两者P45<当前OFF连续2秒后回BYPASS并重新布防
       BYPASS期间若当周期P45≥ON且正常IR光谱/频率判据通过: 按热启动接纳为SUSTAINED
       WARNING掉线超时且PROFILE仍为OBS: 取消本次观察并回BYPASS
@@ -293,28 +279,24 @@ IDLE ──(功率≥当前ON且五判据通过)──→ WARNING ──(积分�
 #### 参数管理
 - **随等级 0~9 插值**: 4.5um进场功率阈值(power=12000~22000)、确认时长(cfm)
 - **固定值(不插值)**: 光谱比阈值(r38/r50)、频率下限(1.0Hz)、频率上限(20Hz)
-- **固定ZCR死区**: 上电从EEPROM直接加载三通道死区，默认15/15/10，不使用启动阶段数据自动标定
-- **手动死区标定**: `ir cal start`后预热5秒，再采集5个互不重叠的2秒窗口；每窗口计算各通道P90(|AC|)，取5次中位数×1.5并限幅到10~30，保存EEPROM后立即生效
+- **FFT固定特征**: 256点窗口在100Hz采样下覆盖2.56秒，频率分辨率约0.390625Hz；FB定义为约1~20Hz能量/非直流全频能量，FC定义为约1.5~20Hz能量/约1~20Hz能量，入场频带占比、核心占比、带内峰值支持度门槛分别为50%/15%/50%，均不随灵敏度变化。另计算三通道频带FFT幅值和X及频域通道比XR，当前只用于样本标定
+- **参考通道策略**: 4.5um始终计算FFT并强制满足火焰频域特征；3.8/5.0um功率分别达到900/400后才计算FFT，并要求与主通道主频差不超过2Hz。低于有效功率的参考通道清空旧频谱且不参与否决
 - **功率抗抖**: ON按等级在12000~22000插值，OFF固定为当前ON的40%，两者仅约束4.5μm主通道；WARNING内主通道功率达到ON或处于OFF~ON迟滞区时有效积分每周期+10ms，功率低于OFF时每周期-10ms，连续2秒后退出WARNING
-- **点火包络分类**: BYPASS下P45低于当前OFF满1秒后进入ARMED；第一次跨过当前ON立即记录启动事件，使用0~1.5秒峰值及其后最多1.5秒稳定数据分类。稳定均值只统计P45≥OFF的有效样本，低于OFF的低谷不参与均值。PROFILE和WARNING积分每10ms并行运行；若WARNING在稳定窗中途先达到confirm_ms，必须在FIRE迁移前立即使用当前已采稳定样本收口，不等待3秒最大终点；若确认早于稳定窗且没有稳定样本，则按SUSTAINED放行。仅PEAK≥100000、有有效后段样本且late/peak<40%时判为LIGHTER并阻止FIRE，其余情况按SUSTAINED放行。LIGHTER后续按互不重叠的1秒窗口检查恢复，单窗能量采用或关系：有效均值≥50000，或有效均值恢复至启动PEAK的40%以上；固定阈值覆盖巨大轰燃峰值后的酒精稳定火焰，相对阈值覆盖远距离、低透过率或低增益场景。两条路径都必须满足P45≥OFF有效占比≥60%，并连续2窗通过才单向升级为SUSTAINED，任一窗口不通过即清零连续次数。SUSTAINED禁止反向降级。BYPASS热启动仍要求当周期P45≥ON且正常IR光谱/频率判据通过，不读取掉线尾段遗留的旧WARNING。P45连续低于OFF满2秒后回BYPASS，再安静1秒布防
-- **频率锁存**: ZCR范围和三通道一致性只作为IDLE进入WARNING的门槛；WARNING不重复检查滚动ZCR，避免0.25Hz量化台阶清空确认进度
-- **EEPROM版本**: UV为v3；IR为v6，旧v5缺少固定死区，首次启动时自动恢复为v6默认值
+- **点火包络分类**: BYPASS下P45低于当前OFF满1秒后进入ARMED；第一次跨过当前ON立即记录启动事件，使用0~1.5秒峰值及其后最多1.5秒稳定数据分类。稳定均值只统计P45≥OFF的有效样本，低于OFF的低谷不参与均值。PROFILE和WARNING积分每10ms并行运行；若WARNING在稳定窗中途先达到confirm_ms，必须在FIRE迁移前立即使用当前已采稳定样本收口，不等待3秒最大终点；若确认早于稳定窗且没有稳定样本，则按SUSTAINED放行。仅PEAK≥100000、有有效后段样本且late/peak<50%时判为LIGHTER并阻止FIRE，其余情况按SUSTAINED放行。LIGHTER后续按互不重叠的1秒窗口检查恢复，两条路径分别累计且均要求P45≥OFF有效占比≥60%：相对路径要求有效均值恢复至启动PEAK的30%以上并连续2窗，固定路径要求有效均值≥50000并连续5窗；任一路径完成后单向升级为SUSTAINED，任一窗口失败只清零对应路径计数。SUSTAINED禁止反向降级。BYPASS热启动仍要求当周期P45≥ON且正常IR光谱/频率判据通过，不读取掉线尾段遗留的旧WARNING。P45连续低于OFF满2秒后回BYPASS，再安静1秒布防
+- **频域抗抖**: IDLE使用严格频带及FB/FC/FP=500/150/500；WARNING保持配置的主频下限，仅将上限放宽一个FFT频点，并使用350/80/350维持门槛。短时频域失败按每10ms回退积分，连续失败2秒才退出WARNING；频谱最多滞后100ms，功率与状态机仍保持10ms周期
+- **EEPROM版本**: UV为v3；IR为v7，为避免现场参数失效，旧ZCR死区三个字仍保留为布局兼容占位，FFT算法不读取
 
 ### 串口协议帧格式
 
 ```
-┌──────┬──────┬──────┬──────┬──────────┬──────┬──────┐
-│ STX  │ SEQ  │ LEN  │ FCODE│  DATA    │ CRC16│ ETX  │
-│ 1B   │ 1B   │ 1B   │ 1B   │  nB      │ 2B   │ 1B   │
-└──────┴──────┴──────┴──────┴──────────┴──────┴──────┘
+AA 55 | Version(0x10) | PayloadLen | SequenceLE16 | MessageID | Data | CRC16LE
 ```
 
-- STX=0x02, ETX=0x03（宏定义可改）
-- LEN = FCODE(1B) + DATA(nB) + CRC16(2B) = n+3（LEN 不包含自身）
-- CRC 范围：从 LEN 到 DATA 末尾，共(LEN-1)字节
-- SEQ 在 `AP_UART_Send` 内部统一自增，外部不涉足
-- 所有发送默认需要 ACK，超时重传（TIM6 每 1ms 递减 `timeout_cnt`）
-- FCode 回调表：GET_PARAM / SET_PARAM / HEARTBEAT，未注册 FCode 回复 data[0]=1
+- 单帧线长上限为128 B；固定开销9 B，因此业务Data最大119 B、PayloadLen最大122 B
+- CRC 使用 CCITT-FALSE，范围为 Sequence 至 Data，在线帧中按小端发送
+- `0x80` 建联；`0x81`空Data读取配置并以同一ID返回84 B纯配置快照；各配置项使用独立SET ID
+- `0xF0` 固定携带原请求序号、原 ID、成功/失败及保留错误码，共 6 B；收到 F0 不再响应
+- GET 成功依次返回 `0x81` 配置数据帧和 `0xF0` 完成帧，重发请求时两帧整体重放
 
 ## 初始化顺序（main.c）
 
@@ -328,41 +310,30 @@ AP_EEPROM_Init();                   // 加载 ADC/UV/IR 3组参数(EEPROM→内�
 AP_IR_Init();                       // 从 EEPROM 加载参数并初始化红外检测
 AP_UV_Init(NULL);                   // 从 EEPROM 读取参数并初始化紫外检测
 AP_ADC_Init();                      // 启动 ADC DMA
-AP_UART_ProtocolInit();             // 清协议缓冲
+AP_UART_ProtocolInit();             // 清解析器、会话和请求去重状态
 ```
 
 ## 主循环框架（while(1)）
 
 ```c
-#if !defined(IR_TEST_MODE)
-  // 正常模式: 串口通信
-  AP_UART_TxTask();      // TX 状态机
-  AP_UART_RxTask();      // RX 状态机
-#endif
+recover_input_task();
+AP_UART_RxTask();
+AP_UART_TxTask();
+AP_UART_CheckTimeout(); // 收包优先，避免10s边界误清已到达请求
+AP_ADC_FaultMonitorTask(now);
+cmd_parser_task();      // USART1 命令行
 
-cmd_parser_task();     // 命令行解析
-
-#if defined(IR_TEST_MODE)
-  // 测试模式: 仅 Feed ADC 填历史窗口, 不进状态机
-  AP_IR_Feed();
-  if (test_print_pending && test_print_enabled) {
-      test_print_pending = 0;
-      test_print_data();          // 紧凑格式打印 UV 脉冲
-      AP_IR_DebugProcess(now);    // 打印 DC/Power/ZCR/光谱比
-  }
-#else
-  // 正常模式: 紫外检测 + 红外检测 + 双重确认
+if (APP_GetTestMode()) {
+  // 运行时测试模式: 仅按标志采集/打印，不推进报警状态机
+  AP_IR_DebugProcess(now);
+  AP_UV_PrintData(now);
+} else {
   AP_UV_Task();                   // Feed+Process → 状态机
-  AP_IR_Task();                   // Feed+Process → 五判据 → 状态机
+  if (!APP_GetShowMode()) AP_IR_Task();
 
-  // 双重确认: UV && IR 同时触发 → 火警上报 + 硬件报警输出
-  if (UV_STATE_FIRE && IR_STATE_FIRE) {
-      BSP_ALARM_Set();
-      AP_UART_Send(FIRE_ALARM);
-  } else {
-      BSP_ALARM_Reset();
-  }
-#endif
+  // 正常模式为 UV&&IR；演示模式只依据 UV，报警输出低电平有效
+  update_alarm_output();
+}
 
 BSP_IWDG_CheckAndRefresh();   // 喂狗
 ```
@@ -373,10 +344,10 @@ BSP_IWDG_CheckAndRefresh();   // 喂狗
 ADC 硬件 → DMA → adc_dma_buf[3] (BSP DMA1_CH1 CIRCULAR)
                     ↓
             AP_IR_Feed() / AP_IR_Feed()
-            → 每通道连续 IIR → history_push() 到 200 点历史窗口
+            → 每通道连续 IIR → history_push() 到 256 点历史窗口
             → AP_IR_Process() / AP_IR_DebugProcess()
-            → 最近50点提取DC/Power，最近200点提取ZCR
-            → 特征提取(Power/ZCR/光谱比)
+            → 最近50点提取DC/Power，最近256点提取FFT特征
+            → 特征提取(Power/FFT主频/频带能量/光谱比)
             → 五判据串联 → 状态机(IDLE→WARNING→FIRE)
             → 与 UV 状态逻辑与 → 最终火警
 
@@ -385,44 +356,45 @@ TIM3 CH1/CH2 → 双通道捕获 (BSP)
                     主循环: AP_UV_Task() → Feed → AP历史队列(64组)
                     → 窗口计数 → 状态机(IDLE→WARNING→FIRE)
 
-AP_UART_Send → TX事件缓冲 → TxTask → 组帧→CRC→BSP_UART_Write→等ACK
-                                            ↑ CheckTimeout(TIM6 1ms)
-
-RX → BSP_UART DMA循环缓冲 → RxTask → 三步解析→CRC→FCode表→回复ACK
-                                            └── ACK匹配 → tx_ack_flag → tx_complete
+树莓派请求 → USART2 RX DMA循环缓冲 → 有界流式解析 → CRC/会话/序号检查
+           → 参数整组校验 → EEPROM写后读回 → 运行时生效
+           → SET/HANDSHAKE回复F0；GET回复0x81配置数据帧+F0
+           → TxTask按发送偏移推进USART2 DMA，缓存响应供重复请求重放
 
 TIM5 → BSP_LED_TickHandler → LED 翻转
-TIM6 → AP_UART_CheckTimeout() + 置位标志(IR_feed_pending, test_print_pending)
+TIM6 → 仅置位标志(IR_feed_pending, test_print_pending)
 ```
 
-## 测试模式 (IR_TEST_MODE)
+## 运行时测试模式
 
-测试模式开关定义在 `Code/ap/inc/ap_util.h`，取消 `IR_TEST_MODE` 宏定义行的注释即可进入：
+测试模式由 USART1 命令行切换并保存到 SYSTEM EEPROM，不再依赖重新编译和烧录：
 
 - **ISR 仅置标志**：`AP_IR_FeedIsr()` + `test_print_pending`
-- **主循环只跑**：命令行解析 + 定时条件打印（`AP_IR_TestPrint()`内推ADC填窗口，不进状态机）+ 喂狗
-- **测试模式标定**：执行`ir cal start`后需保持IR打印开启，由100Hz测试采样推进标定
-- **不运行**：UV 状态机、IR 五判据算法、双重确认逻辑、串口通信协议(TxTask/RxTask)
+- **主循环保留**：恢复输入、树莓派配置协议、ADC故障监测、命令行、定时采集/打印和喂狗
+- **不运行**：UV 状态机、IR 火焰识别状态机和最终组合报警判断
 - **CLI 控制**：`debug on/off` 启停 100Hz 数据流打印
 - **场景分隔**：`mark [text]` 插入标记行
-- **串口测试**：`uart loop <n>` 发环路测试 / `uart recv` 显示 COM 接收数据
+- **串口测试**：先用`uart raw on`清会话并暂停协议，再用`uart loop <n>`/`uart recv`测试COM；`uart raw off`后树莓派需重新握手
 - **LED 控制**：`led work <ms>` / `led blink <n> <ms>` / `led stop`
 - **打印格式**：紧凑单行，PC 端 Python/Excel 可解析
   每 100Hz 输出 2 行：
   ```
   T<ms> UV <n> <w1> <w2>...
-  T<ms> IRD DC=<d0>,<d1>,<d2> P=<p0>,<p1>,<p2> Z10=<z0>,<z1>,<z2> R1000=<r38>,<r50>
+  T<ms> IRD DC=<...> P=<...> F10=<...> FB1000=<...> FC1000=<...> FP1000=<...> X=<...> XR1000=<...> REFV=<...> R1000=<...>
   ```
   - DC: 原始最近50点窗口均值 (ADC 偏置)
   - P: 最近50点平均功率（去直流信号均方值）
-  - Z10: 最近200点过零率 ×10（整数15表示1.5Hz）
+  - F10: 最近256点FFT主频 ×10（整数12约表示1.2Hz，16约表示1.6Hz）
+  - FB1000/FC1000: 配置频带能量占比/1.5Hz以上核心能量占比，均为×1000
+  - FP1000: 带内主峰能量/全频最大单点能量 ×1000
+  - X/XR1000: 三通道频带FFT幅值和及4.5/参考通道频域比值；无效参考通道对应比值为0
   - R1000: 光谱比 ×1000（整数1500表示1.500；参考功率严格为0时为0）
 
 ## 应用算法调试 (AP_ALGO_DEBUG_ENABLE)
 
-取消 `Code/ap/inc/ap_util.h` 中该宏的注释后，IR算法输出初始化参数、200点窗口就绪、每500ms特征快照、限频后的判据失败、功率掉线/恢复、点火包络分类、状态迁移及FIRE超时；UV算法输出每500ms窗口计数/覆盖统计和状态迁移；最终IR&&UV报警沿输出独立的`[ALARM]`日志。宏关闭时相关计时变量和日志函数不参与编译。
+取消 `Code/ap/inc/ap_util.h` 中该宏的注释后，IR算法输出初始化参数、256点FFT窗口就绪、每500ms特征快照、限频后的判据失败、功率掉线/恢复、点火包络分类、状态迁移及FIRE超时；UV算法输出每500ms窗口计数/覆盖统计和状态迁移；最终IR&&UV报警沿输出独立的`[ALARM]`日志。宏关闭时相关计时变量和日志函数不参与编译。
 
-手动标定时输出每个窗口的`[IR] ZCR_CAL window=<n>/5 P90=<...>`以及保存结果`[IR] ZCR_CAL saved DZ=<...>`；特征快照增加`PROF=BYPASS|ARMED|OBS|LIGHTER|SUSTAINED`。首次跨过当前等级ON输出`PROFILE onset P=<...> ON=<...>`；分类输出`PROFILE result=<...> PEAK=<...> PMIN=100000 LATE=<...> R1000=<...> DUTY1000=<...> VALID=<有效数>/<总数> LATE_MS=<实际稳定窗毫秒> OBS=<ms> MODE=FULL|FIRE_READY`。LIGHTER恢复输出`MEAN/RMIN/R1000/ABS/REL/DUTY1000/HIT`，其中`ABS`表示均值≥50000，`REL`表示恢复比例≥40%，二者任一为1且连续2窗通过时输出`PROFILE LIGHTER -> SUSTAINED`；BYPASS热启动输出`PROFILE BYPASS -> SUSTAINED REASON=HOT_START ...`。
+特征快照输出 `F10`、`FB1000`、`FC1000` 以及 `PROF=BYPASS|ARMED|OBS|LIGHTER|SUSTAINED`。首次跨过当前等级ON输出`PROFILE onset P=<...> ON=<...>`；其余点火包络日志格式保持不变。
 
 ## 项目进度
 
@@ -435,9 +407,9 @@ TIM6 → AP_UART_CheckTimeout() + 置位标志(IR_feed_pending, test_print_pendi
 | IR 红外三波段检测 | ✅ 完成 | 多光谱融合五判据、并行点火包络分类、三级状态机、Q15定点IIR |
 | EEPROM 参数存储 | ✅ 完成 | ADC/UV/IR 三扇区，魔数+CRC校验 |
 | IWDG 看门狗 | ✅ 完成 | ISR置标志→主循环喂狗模式 |
-| 串口协议 | ✅ 完成 | TX三态机+RX三步入解析，CRC16，ACK重传 |
+| 树莓派配置协议 | ✅ 完成 | USART2从机、AA55流式解析、10s会话、序号去重、配置读写及F0应答 |
 | 命令行框架 | ✅ 完成 | help/adc/uv/ir/param/state/reset/debug/mark/led/uart |
 | 硬件报警(ALM1/ALM2) | ✅ 完成 | BSP驱动，火警低电平输出 |
-| IR 信号链调试打印 | ✅ 完成 | 测试模式打印DC/Power/ZCR/光谱比；应用模式打印限频特征快照和状态机事件 |
+| IR 信号链调试打印 | ✅ 完成 | 测试模式打印DC/Power/FFT/光谱比；应用模式打印限频特征快照和状态机事件 |
 | 双重确认(IR&&UV) | ✅ 完成 | 逻辑与→FIRE_ALARM上报+ALM硬件输出 |
 | 参数现场标定 | ⏳ 待定 | 需真实火焰数据标定阈值 |

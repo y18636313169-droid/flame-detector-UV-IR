@@ -10,6 +10,7 @@
 #include "ap_eeprom.h"
 #include "ap_uv.h"
 #include "ap_ir.h"
+#include "ap_uart_protocol.h"
 #include "main.h"
 #include "ap_util.h"
 
@@ -160,7 +161,6 @@ static void cmd_help(int argc, char **argv)
     CMD_PRINTF("  adc threshold <ch> <val> — set ADC threshold\r\n");
     CMD_PRINTF("  uv                       — print UV detector state\r\n");
     CMD_PRINTF("  ir                       — print IR state & features\r\n");
-    CMD_PRINTF("  ir cal start|status|cancel — manual ZCR dead-zone calibration\r\n");
     CMD_PRINTF("  state                    — print system state\r\n");
     CMD_PRINTF("  reset                    — software reset MCU\r\n");
     CMD_PRINTF("  debug <on/off>           — toggle test data print\r\n");
@@ -172,8 +172,9 @@ static void cmd_help(int argc, char **argv)
     CMD_PRINTF("  test mode [on|off]       — persistent runtime test mode\r\n");
     CMD_PRINTF("  show mode [on|off]       — persistent UV-only demonstration mode\r\n");
     CMD_PRINTF("  profile [on|off]         — persistent IR ignition-profile switch\r\n");
-    CMD_PRINTF("  uart loop <n>            — COM loopback test, send N bytes\r\n");
-    CMD_PRINTF("  uart recv                — print received COM data on DBG\r\n");
+    CMD_PRINTF("  uart raw <on/off>        — pause/resume protocol for COM test\r\n");
+    CMD_PRINTF("  uart loop <n>            — send N raw bytes on COM\r\n");
+    CMD_PRINTF("  uart recv                — print raw COM data on DBG\r\n");
 }
 
 /* ========================================================================== */
@@ -260,10 +261,6 @@ static void cmd_param(int argc, char **argv)
             (unsigned long)ir->r50_threshold);
         CMD_PRINTF("  freq: low=%lu high=%lu (×10,固定)\r\n",
             (unsigned long)ir->freq_low_x10, (unsigned long)ir->freq_high_x10);
-        CMD_PRINTF("  zcr dead zone: %lu,%lu,%lu (fixed)\r\n",
-            (unsigned long)ir->zcr_dead_zone[0],
-            (unsigned long)ir->zcr_dead_zone[1],
-            (unsigned long)ir->zcr_dead_zone[2]);
         CMD_PRINTF("  cfm:  %lu→%lu (ms)\r\n",
             (unsigned long)ir->cfm_min, (unsigned long)ir->cfm_max);
         CMD_PRINTF("--- ADC thresholds ---\r\n");
@@ -485,10 +482,6 @@ static void cmd_param_ir(int argc, char **argv)
         CMD_PRINTF("r38  %lu (fixed)\r\n", (unsigned long)r38);
         CMD_PRINTF("r50  %lu (fixed)\r\n", (unsigned long)r50);
         CMD_PRINTF("freq  %lu %lu\r\n", (unsigned long)freq_low, (unsigned long)freq_high);
-        CMD_PRINTF("zcr dead zone  %lu %lu %lu (fixed)\r\n",
-            (unsigned long)ir->zcr_dead_zone[0],
-            (unsigned long)ir->zcr_dead_zone[1],
-            (unsigned long)ir->zcr_dead_zone[2]);
         CMD_PRINTF("cfm  %lu %lu\r\n", (unsigned long)cfm_min, (unsigned long)cfm_max);
         return;
     }
@@ -547,62 +540,10 @@ static void cmd_uv(int argc, char **argv)
 /*                         ir — 红外三波段检测状态 + 实时特征                   */
 /* ========================================================================== */
 
-static const char *ir_cal_state_name(AP_IR_ZcrCalState_t state)
-{
-    switch (state) {
-        case AP_IR_ZCR_CAL_IDLE:       return "IDLE";
-        case AP_IR_ZCR_CAL_WARMUP:     return "WARMUP";
-        case AP_IR_ZCR_CAL_COLLECTING: return "COLLECTING";
-        case AP_IR_ZCR_CAL_DONE:       return "DONE";
-        case AP_IR_ZCR_CAL_ERROR:      return "ERROR";
-        default:                       return "?";
-    }
-}
-
-static void cmd_ir_calibration(int argc, char **argv)
-{
-    if ((argc == 2) || ((argc >= 3) && (strcmp(argv[2], "status") == 0))) {
-        AP_IR_ZcrCalStatus_t status;
-        AP_IR_GetZcrCalibrationStatus(&status);
-        CMD_PRINTF("IR ZCR cal: %s windows=%u/%u remaining=%lu ms DZ=%u,%u,%u\r\n",
-            ir_cal_state_name(status.state),
-            (unsigned int)status.windows_collected,
-            (unsigned int)status.windows_total,
-            (unsigned long)status.remaining_ms,
-            (unsigned int)status.dead_zone[0],
-            (unsigned int)status.dead_zone[1],
-            (unsigned int)status.dead_zone[2]);
-        return;
-    }
-
-    if (strcmp(argv[2], "start") == 0) {
-        int result = AP_IR_StartZcrCalibration();
-        if (result == 0) {
-            /* 标定由100Hz红外任务推进，命令本身不阻塞主循环。 */
-            CMD_PRINTF("IR ZCR cal started: warmup 5s, then 5 x 2s windows\r\n");
-        } else if (result == -1) {
-            CMD_PRINTF("IR ZCR cal is already running\r\n");
-        } else {
-            CMD_PRINTF("IR ZCR cal requires IR state IDLE\r\n");
-        }
-        return;
-    }
-
-    if (strcmp(argv[2], "cancel") == 0) {
-        AP_IR_CancelZcrCalibration();
-        CMD_PRINTF("IR ZCR cal cancelled; stored DZ unchanged\r\n");
-        return;
-    }
-
-    CMD_PRINTF("Usage: ir cal start|status|cancel\r\n");
-}
-
 static void cmd_ir(int argc, char **argv)
 {
-    if ((argc >= 2) && (strcmp(argv[1], "cal") == 0)) {
-        cmd_ir_calibration(argc, argv);
-        return;
-    }
+    (void)argc;
+    (void)argv;
     const char *s;
     switch (AP_IR_GetState()) {
         case IR_STATE_IDLE:    s = "IDLE";    break;
@@ -613,26 +554,21 @@ static void cmd_ir(int argc, char **argv)
     CMD_PRINTF("IR state: %s\r\n", s);
 
     uint32_t power[3];
-    float    zcr[3];
+    float    dominant_freq[3];
     uint32_t r45_38, r45_50;
-    uint16_t dead_zone[3];
-    AP_IR_GetFeatures(power, zcr, &r45_38, &r45_50);
-    uint8_t dead_zone_ready = AP_IR_GetZcrDeadZone(dead_zone);
-    /* nano printf不保证浮点格式支持，ZCR按×10定点整数输出。 */
-    uint32_t zcr_x10[3] = {
-        (uint32_t)(zcr[0] * 10.0f + 0.5f),
-        (uint32_t)(zcr[1] * 10.0f + 0.5f),
-        (uint32_t)(zcr[2] * 10.0f + 0.5f)
+    AP_IR_GetFeatures(power, dominant_freq, &r45_38, &r45_50);
+    /* nano printf不保证浮点格式支持，FFT主频按×10定点整数输出。 */
+    uint32_t freq_x10[3] = {
+        (uint32_t)(dominant_freq[0] * 10.0f + 0.5f),
+        (uint32_t)(dominant_freq[1] * 10.0f + 0.5f),
+        (uint32_t)(dominant_freq[2] * 10.0f + 0.5f)
     };
 
     CMD_PRINTF("  P[38]=%lu  P[45]=%lu  P[50]=%lu\r\n",
         (unsigned long)power[0], (unsigned long)power[1], (unsigned long)power[2]);
-    CMD_PRINTF("  ZCRx10[38]=%lu  ZCRx10[45]=%lu  ZCRx10[50]=%lu\r\n",
-        (unsigned long)zcr_x10[0], (unsigned long)zcr_x10[1],
-        (unsigned long)zcr_x10[2]);
-    CMD_PRINTF("  DZ[38]=%u  DZ[45]=%u  DZ[50]=%u  stored=%u\r\n",
-        (unsigned int)dead_zone[0], (unsigned int)dead_zone[1],
-        (unsigned int)dead_zone[2], (unsigned int)dead_zone_ready);
+    CMD_PRINTF("  FFT_Fx10[38]=%lu  FFT_Fx10[45]=%lu  FFT_Fx10[50]=%lu\r\n",
+        (unsigned long)freq_x10[0], (unsigned long)freq_x10[1],
+        (unsigned long)freq_x10[2]);
     CMD_PRINTF("  R45/38=%lu.%03lu  R45/50=%lu.%03lu\r\n",
         (unsigned long)(r45_38 / 1000), (unsigned long)(r45_38 % 1000),
         (unsigned long)(r45_50 / 1000), (unsigned long)(r45_50 % 1000));
@@ -974,21 +910,51 @@ static void cmd_uart(int argc, char **argv)
         return;
     }
     if (argc < 2) {
-        CMD_PRINTF("Usage: uart loop <n> | recv\r\n");
+        CMD_PRINTF("Usage: uart raw <on/off> | loop <n> | recv\r\n");
         return;
     }
 
-    if (strcmp(argv[1], "loop") == 0) {
+    if (strcmp(argv[1], "raw") == 0) {
+        if (argc != 3 ||
+            (strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0)) {
+            CMD_PRINTF("Usage: uart raw <on/off>\r\n");
+            return;
+        }
+        if (strcmp(argv[2], "on") == 0) {
+            AP_UART_SetDiagnosticMode(true);
+            CMD_PRINTF("uart raw=on, protocol session cleared\r\n");
+        } else {
+            if (!BSP_UART_IsTxComplete(BSP_UART_COM)) {
+                CMD_PRINTF("uart: COM TX busy\r\n");
+                return;
+            }
+            AP_UART_SetDiagnosticMode(false);
+            CMD_PRINTF("uart raw=off, protocol requires handshake\r\n");
+        }
+
+    } else if (strcmp(argv[1], "loop") == 0) {
         uint32_t n = (argc > 2) ? strtoul(argv[2], NULL, 0) : 16;
+        if (n == 0U) n = 1U;
         if (n > 128) n = 128;
         uint8_t buf[128];
+        if (!AP_UART_GetDiagnosticMode()) {
+            CMD_PRINTF("uart: enable 'uart raw on' first\r\n");
+            return;
+        }
         for (uint32_t i = 0; i < n; i++) buf[i] = (uint8_t)(i & 0xFF);
-        BSP_UART_Write(BSP_UART_DBG, buf, (uint16_t)n);
-        BSP_UART_Printf("[UART] loopback %lu bytes sent on COM\r\n", (unsigned long)n);
+        if (BSP_UART_Write(BSP_UART_COM, buf, (uint16_t)n) != (uint16_t)n) {
+            BSP_UART_Printf("[UART] COM send failed\r\n");
+        } else {
+            BSP_UART_Printf("[UART] loopback %lu bytes sent on COM\r\n", (unsigned long)n);
+        }
 
     } else if (strcmp(argv[1], "recv") == 0) {
         uint8_t buf[64];
-        uint16_t len = BSP_UART_Read(BSP_UART_DBG, buf, sizeof(buf));
+        if (!AP_UART_GetDiagnosticMode()) {
+            CMD_PRINTF("uart: enable 'uart raw on' first\r\n");
+            return;
+        }
+        uint16_t len = BSP_UART_Read(BSP_UART_COM, buf, sizeof(buf));
         if (len > 0) {
             BSP_UART_Printf("[UART] COM recv %u bytes:\r\n  HEX: ", (unsigned)len);
             for (uint16_t i = 0; i < len; i++) {
@@ -1003,7 +969,7 @@ static void cmd_uart(int argc, char **argv)
             BSP_UART_Printf("[UART] COM no data\r\n");
         }
     } else {
-        CMD_PRINTF("Usage: uart loop <n> | recv\r\n");
+        CMD_PRINTF("Usage: uart raw <on/off> | loop <n> | recv\r\n");
     }
 }
 /* ========================================================================== */

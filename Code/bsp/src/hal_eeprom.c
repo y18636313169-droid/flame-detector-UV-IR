@@ -44,6 +44,25 @@ int BSP_EEPROM_Write(uint32_t addr, const void *buf, uint32_t size)
     return 0;
 }
 
+int BSP_EEPROM_Verify(uint32_t addr, const void *buf, uint32_t size)
+{
+    volatile const uint32_t *stored = (volatile const uint32_t *)addr;
+    const uint32_t *expected = (const uint32_t *)buf;
+
+    if (buf == NULL || size == 0U || (addr & 3U) != 0U ||
+        (((uintptr_t)buf) & 3U) != 0U || (size & 3U) != 0U) {
+        return -1;
+    }
+
+    /* DATA EEPROM为内存映射区，逐字读回可发现HAL写入成功但内容未落稳的情况。 */
+    for (uint32_t i = 0U; i < size / sizeof(uint32_t); i++) {
+        if (stored[i] != expected[i]) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* ========================================================================== */
 /*                    校验加载模板                                             */
 /* ========================================================================== */
@@ -83,8 +102,16 @@ int BSP_EEPROM_LoadSector(uint32_t addr, void *buf, uint32_t size,
 int BSP_EEPROM_SaveSector(uint32_t addr, void *buf, uint32_t size,
                            uint16_t crc_off)
 {
+    int ret;
+
     *(uint16_t *)((uint8_t *)buf + crc_off) = 0;
     *(uint16_t *)((uint8_t *)buf + crc_off) = CRC16_CCITT((const uint8_t *)buf, size);
 
-    return BSP_EEPROM_Write(addr, buf, size);
+    ret = BSP_EEPROM_Write(addr, buf, size);
+    if (ret != 0) {
+        return ret;
+    }
+
+    /* SUCCESS必须代表完整结构和CRC均已落盘，协议层才能据此回复成功。 */
+    return BSP_EEPROM_Verify(addr, buf, size);
 }

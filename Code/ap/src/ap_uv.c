@@ -180,6 +180,14 @@ void AP_UV_Feed(void)
     }
 }
 
+void AP_UV_ClearPulseHistory(void)
+{
+    /* uv_det history is main-loop owned; BSP clear protects its ISR ring itself. */
+    uv_det.head = 0U;
+    uv_det.count = 0U;
+    (void)BSP_TIM_IC_ClearAllPulse(BSP_TIM_UV);
+}
+
 void AP_UV_Process(uint32_t now)
 {
     /* ---- 移除检测窗口外的旧脉冲 ---- */
@@ -350,7 +358,7 @@ void AP_UV_Process_Reset(void)
 #endif
 
     /* 清空 TIM3 脉冲环缓冲，防止旧脉冲影响新判定 */
-    BSP_TIM_IC_ClearAllPulse(BSP_TIM_UV);
+    (void)BSP_TIM_IC_ClearAllPulse(BSP_TIM_UV);
     DBG("Reset -> IDLE, pulse history cleared");
 }
 

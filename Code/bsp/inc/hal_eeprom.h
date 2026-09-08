@@ -62,6 +62,16 @@ void BSP_EEPROM_Read(uint32_t addr, void *buf, uint32_t size);
   */
 int  BSP_EEPROM_Write(uint32_t addr, const void *buf, uint32_t size);
 
+/**
+  * @brief  读回并逐字比较 EEPROM 内容
+  * @param  addr: EEPROM 地址（需 4 字节对齐）
+  * @param  buf:  期望内容（需 4 字节对齐）
+  * @param  size: 比较字节数（需 4 的倍数）
+  * @retval 0: 读回内容完全一致
+  * @retval -1: 参数非法或任一字不一致
+  */
+int  BSP_EEPROM_Verify(uint32_t addr, const void *buf, uint32_t size);
+
 /* ========================================================================== */
 /*                    校验加载模板                                             */
 /* ========================================================================== */

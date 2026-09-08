@@ -9,7 +9,7 @@
   *          Process 内部:
   *            1. 每通道连续执行 20Hz 二阶 IIR 低通滤波
   *            2. 最近 50 点去直流并计算平均功率(均方值) → uint32_t
-  *            3. 最近 200 点独立去直流并计算过零率 → float Hz
+  *            3. 最近 256 点独立去直流，定点FFT提取主频和频带能量占比
   *            4. 计算光谱比 R4.5/3.8 和 R4.5/5.0 (×1000)
   *            5. 五判据串联决策
   *            6. 独立点火包络分类(打火机快速衰减/持续燃烧)
@@ -52,10 +52,22 @@
 #define IIR_A1_Q15  (-12104) /* -0.3695 * 32768 */
 #define IIR_A2_Q15  6416     /*  0.1958 * 32768 */
 
-#define IR_SAMPLE_RATE_HZ             (100.0f)
-#define IR_FREQ_CONSISTENCY_X10       (20U)
-#define IR_ZCR_HOLD_MARGIN_X10        (3U)    /* 2秒ZCR窗口一个量化档约0.25Hz */
-#define IR_REF_ZCR_RMS_GAIN           (2U)    /* 参考RMS至少达到2倍死区才信任ZCR */
+#define IR_SAMPLE_RATE_HZ_X10         (1000U) /* 100Hz按×10定点表示 */
+#define IR_FFT_BIN_WIDTH_X10 \
+    ((IR_SAMPLE_RATE_HZ_X10 + IR_FFT_WINDOW_SIZE / 2U) / IR_FFT_WINDOW_SIZE) /* 256点约0.4Hz */
+#define IR_FFT_UPDATE_MS               (100U) /* 频谱比功率变化慢，10Hz刷新可降低CPU占用 */
+#define IR_FFT_CORE_LOW_X10             (15U) /* FC从1.5Hz起算，覆盖现场有效火焰常见的1.6~4Hz波动 */
+#define IR_FFT_BAND_RATIO_MIN_X1000     (500U) /* 配置频带至少占非直流总能量50%，最大值为1000 */
+#define IR_FFT_CORE_RATIO_MIN_X1000     (150U) /* 1.5Hz以上能量至少占火焰频带15%，抑制接近直流的慢扰动 */
+#define IR_FFT_PEAK_SUPPORT_MIN_X1000   (500U) /* 带内主峰至少达到全频最大峰值50%，容忍孤立带外毛刺 */
+/* WARNING维持采用较宽松的频域门槛，形成“严格进入、宽松维持”的频域迟滞。 */
+#define IR_FFT_HOLD_BAND_RATIO_MIN_X1000    (350U)
+#define IR_FFT_HOLD_CORE_RATIO_MIN_X1000     (80U)
+#define IR_FFT_HOLD_PEAK_SUPPORT_MIN_X1000  (350U)
+#define IR_FFT_REF_A_POWER_MIN          (900U) /* 3.8um有效功率下限：低于该值时主频易被本底噪声支配 */
+#define IR_FFT_REF_B_POWER_MIN          (400U) /* 5.0um有效功率下限：沿用原死区有效性换算结果 */
+#define IR_FFT_REF_DIFF_MAX_X10          (20U) /* 有效参考通道与4.5um主频最大允许差：2.0Hz */
+#define IR_FFT_Q30_ONE          (1073741824LL)
 #define IR_POWER_OFF_PERCENT          (40U)   /* 迟滞退出阈值=当前进场阈值的40% */
 #define IR_POWER_DROPOUT_MS           (2000U) /* 连续低功率2秒才退出WARNING */
 #define IR_CRITERIA_DROPOUT_MS        (2000U) /* 光谱/频率连续失效2秒才退出WARNING */
@@ -71,7 +83,7 @@
  * “0->峰值->快速衰减”过程；随后最多1.5秒独立统计衰减后的稳定能量和迟滞
  * 下限占空比。峰值窗与稳定窗不重叠；若WARNING先达到FIRE确认条件，稳定窗
  * 立即使用已采样本提前收口，不强制等待最大窗口结束。启动捕获
- * 不等待光谱/ZCR，因而不会遗漏真实点火峰值。
+   * 不等待光谱/FFT，因而不会遗漏真实点火峰值。
  *
  * 本段变量/日志术语：
  *   P45      = 4.5um主通道最近0.5秒去直流信号的均方值；
@@ -95,12 +107,22 @@
 #define IR_PROFILE_LATE_START_MS  (IR_PROFILE_PEAK_WINDOW_MS) /* 稳定窗紧接峰值窗 */
 #define IR_PROFILE_OBSERVE_END_MS \
     (IR_PROFILE_LATE_START_MS + IR_PROFILE_LATE_WINDOW_MAX_MS) /* 完整观察最大时长 */
-#define IR_PROFILE_DECAY_RATIO_X1000        (400U) /* LATE/PEAK门限：400表示40.0% */
+#define IR_PROFILE_DECAY_RATIO_X1000        (500U) /* LATE/PEAK低于50%时视为打火机式快速衰减 */
 #define IR_PROFILE_LIGHTER_PEAK_MIN       (100000U) /* 打火机峰值门槛：低能量启动沿不参与打火机分类 */
 #define IR_PROFILE_RECOVERY_WINDOW_MS       (1000U) /* LIGHTER后持续火焰恢复判定窗口，单位ms */
 #define IR_PROFILE_RECOVERY_POWER_MIN      (50000U) /* 恢复窗有效均值门槛：5万以上视为真实火焰候选 */
-#define IR_PROFILE_RECOVERY_CONFIRM_WINDOWS    (2U) /* 连续通过2个恢复窗才升级，拒绝单窗偶发高值 */
+#define IR_PROFILE_RECOVERY_RATIO_X1000       (300U) /* 快路径：恢复到启动峰值30%，适应不同距离和增益 */
+#define IR_PROFILE_RECOVERY_REL_WINDOWS         (2U) /* 相对恢复连续2窗即可确认真实火焰 */
+#define IR_PROFILE_RECOVERY_ABS_WINDOWS         (5U) /* 固定5万需连续5窗，避免持续打火机过快升级 */
 #define IR_PROFILE_RECOVERY_DUTY_X1000       (600U) /* 恢复窗口内P45>=OFF至少占60%，避免单点峰值升级 */
+
+/* 维持门槛必须不高于入场门槛，否则WARNING会在进入后的下一周期立即掉线。 */
+#if (IR_FFT_CORE_LOW_X10 == 0U) || \
+    (IR_FFT_HOLD_BAND_RATIO_MIN_X1000 > IR_FFT_BAND_RATIO_MIN_X1000) || \
+    (IR_FFT_HOLD_CORE_RATIO_MIN_X1000 > IR_FFT_CORE_RATIO_MIN_X1000) || \
+    (IR_FFT_HOLD_PEAK_SUPPORT_MIN_X1000 > IR_FFT_PEAK_SUPPORT_MIN_X1000)
+#error "IR FFT hold thresholds must not exceed entry thresholds"
+#endif
 
 #if (IR_PROFILE_PEAK_WINDOW_MS != IR_PROFILE_LATE_START_MS) || \
     (IR_PROFILE_LATE_WINDOW_MAX_MS == 0U) || \
@@ -111,8 +133,11 @@
     ((IR_PROFILE_OBSERVE_END_MS % IR_PROCESS_STEP_MS) != 0U) || \
     ((IR_PROFILE_RECOVERY_WINDOW_MS % IR_PROCESS_STEP_MS) != 0U) || \
     (IR_PROFILE_RECOVERY_POWER_MIN == 0U) || \
-    (IR_PROFILE_RECOVERY_CONFIRM_WINDOWS == 0U) || \
-    (IR_PROFILE_RECOVERY_CONFIRM_WINDOWS > 255U) || \
+    (IR_PROFILE_RECOVERY_REL_WINDOWS == 0U) || \
+    (IR_PROFILE_RECOVERY_ABS_WINDOWS == 0U) || \
+    (IR_PROFILE_RECOVERY_REL_WINDOWS > 255U) || \
+    (IR_PROFILE_RECOVERY_ABS_WINDOWS > 255U) || \
+    (IR_PROFILE_RECOVERY_RATIO_X1000 > 1000U) || \
     (IR_PROFILE_DECAY_RATIO_X1000 > 1000U) || \
     (IR_PROFILE_RECOVERY_DUTY_X1000 > 1000U)
 #error "IR transient profile parameters are invalid"
@@ -146,7 +171,12 @@ typedef struct {
 */
 typedef struct {
     uint32_t    power_x1000;        /* 去直流信号均方值(保留历史字段名) */
-    float       zcr_hz;             /* 过零率(Hz) */
+    uint32_t    band_magnitude_sum; /* 配置频带内FFT幅值和X，供频域多光谱比标定 */
+    uint16_t    dominant_freq_x10;  /* 配置火焰频带内最大能量频点，单位0.1Hz */
+    uint16_t    band_ratio_x1000;   /* 配置火焰频带能量/非直流总能量 */
+    uint16_t    core_ratio_x1000;   /* 1.5Hz~上限能量/约1Hz~上限能量 */
+    uint16_t    peak_support_x1000; /* 带内主峰能量/全频最大单点能量 */
+    uint8_t     fft_valid;          /* 本组频谱与同次功率有效性判断一致 */
 } IR_Features_t;
 
 /**
@@ -187,9 +217,9 @@ typedef enum {
     - late_sum只累加P45>=OFF的有效样本，低于OFF的样本不进入能量均值；
     - late_samples记录窗口总样本数，仅用于计算有效占空比；
     - late_high_samples记录有效样本数，也是late_sum计算均值时的分母。
-  recovery_pass_windows记录连续满足恢复判据的1秒窗口数量。恢复能量采用或关系：
-  有效均值>=5万，或有效均值恢复到启动峰值的40%以上；两条路径都必须同时满足
-  有效占比>=60%。任一窗口不通过立即清零，连续2窗通过才允许升级。
+  recovery_relative_windows和recovery_absolute_windows分别维护两条恢复路径：
+  相对路径要求有效均值恢复到启动峰值30%以上并连续2窗，固定路径要求有效均值
+  达到5万并连续5窗；两条路径均要求有效占比>=60%，任一路径完成即可升级。
   low_power_accum_ms在不同状态下有三种明确语义：
     - BYPASS：重新布防前的连续安静时间；
     - OBSERVING且未见WARNING：判定无效短瞬态的连续安静时间；
@@ -204,7 +234,8 @@ typedef struct {
     uint16_t late_samples;               /* 当前后段窗口的全部10ms样本数量 */
     uint16_t late_high_samples;          /* 当前后段窗口内P45>=OFF的有效样本数量 */
     uint8_t warning_seen;                /* 本次观察是否实际进入过IR WARNING */
-    uint8_t recovery_pass_windows;       /* LIGHTER连续通过恢复判据的1秒窗口数量 */
+    uint8_t recovery_relative_windows;   /* LIGHTER相对峰值快路径连续通过窗口数 */
+    uint8_t recovery_absolute_windows;   /* LIGHTER固定能量慢路径连续通过窗口数 */
 } IR_Profile_t;
 
 /**
@@ -219,8 +250,8 @@ typedef struct {
     IR_Features_t   feat[IR_CH_NUM];
     uint32_t        ratio_45_38_x1000;  /* (P_45 / P_38) ×1000 */
     uint32_t        ratio_45_50_x1000;  /* (P_45 / P_50) ×1000 */
-    uint16_t        zcr_dead_zone[IR_CH_NUM]; /* 从EEPROM加载的各通道固定死区 */
-    uint8_t         dead_zone_ready;          /* EEPROM固定死区加载完成标志 */
+    uint32_t        fft_last_update_ms;       /* 上次三通道FFT完整更新时刻 */
+    uint8_t         fft_ready;                /* 256点窗口和首次FFT已就绪 */
 
     /* 状态机 */
     IR_DetectorState_t  state;
@@ -262,21 +293,17 @@ typedef struct {
 
 static IR_Detector_t s_ir;
 
-/* 手动标定独立保存5个窗口结果；标定完成前不改变正式算法正在使用的死区。 */
-typedef struct {
-    AP_IR_ZcrCalState_t state;
-    uint8_t  windows_collected;
-    uint32_t phase_start_ms;
-    uint32_t next_window_ms;
-    uint16_t p90_window[IR_CH_NUM][IR_ZCR_CAL_WINDOW_COUNT];
-} IR_ZcrCalibration_t;
-
-static IR_ZcrCalibration_t s_zcr_cal;
+/* FFT复数工作区为单实例静态内存，避免在主循环栈上放置1KB临时数组。 */
+static int32_t s_fft_real[IR_FFT_WINDOW_SIZE];
+static int32_t s_fft_imag[IR_FFT_WINDOW_SIZE];
+/* FFT输入工作区使用静态单实例，避免256点FFT与上层局部数组叠加挤占主栈。 */
+static int32_t s_fft_input[IR_FFT_WINDOW_SIZE];
 
 static int32_t iir_lowpass_20hz_sample(uint32_t ch, int32_t x0);
-static uint16_t zcr_to_x10(float zcr_hz);
-static bool reference_zcr_valid(const IR_Detector_t *d, uint32_t ch);
-static void process_zcr_calibration(uint32_t now);
+static void update_fft_features(IR_Detector_t *d, uint32_t now);
+static bool reference_power_valid(const IR_Detector_t *d, uint32_t ch);
+static bool reference_fft_valid(const IR_Detector_t *d, uint32_t ch);
+static uint32_t calc_ratio_x1000(uint32_t numerator, uint32_t denominator);
 
 #if defined(AP_ALGO_DEBUG_ENABLE)
 /* 算法调试日志独立限频，避免判据在100Hz循环中持续占满调试串口。 */
@@ -401,26 +428,46 @@ static void debug_log_features(uint32_t now)
 {
     if (!debug_log_due(&s_debug_last_snapshot_ms, now)) return;
 
-    /* 单行快照覆盖五判据输入和WARNING积分，便于直接对应状态机行为。 */
-    DBG("T%lu S=%s P=%lu,%lu,%lu R1000=%lu,%lu Z10=%u,%u,%u DZ=%u,%u,%u ACC=%lu/%lu DROP=%u REFV=%u,%u PROF=%s",
+    bool ref_a_valid = reference_fft_valid(&s_ir, IR_CH_REF_A);
+    bool ref_b_valid = reference_fft_valid(&s_ir, IR_CH_REF_B);
+    uint32_t fft_ratio_38 = ref_a_valid
+                          ? calc_ratio_x1000(s_ir.feat[IR_CH_MAIN].band_magnitude_sum,
+                                             s_ir.feat[IR_CH_REF_A].band_magnitude_sum) : 0U;
+    uint32_t fft_ratio_50 = ref_b_valid
+                          ? calc_ratio_x1000(s_ir.feat[IR_CH_MAIN].band_magnitude_sum,
+                                             s_ir.feat[IR_CH_REF_B].band_magnitude_sum) : 0U;
+
+    /* X/XR是专利中的频带FFT幅值和及通道比；暂只观测，不加入未标定硬阈值。 */
+    DBG("T%lu S=%s P=%lu,%lu,%lu R1000=%lu,%lu F10=%u,%u,%u FB1000=%u,%u,%u FC1000=%u,%u,%u FP1000=%u,%u,%u X=%lu,%lu,%lu XR1000=%lu,%lu REFV=%u,%u ACC=%lu/%lu DROP=%u PROF=%s",
         (unsigned long)now, ir_state_name(s_ir.state),
         (unsigned long)s_ir.feat[0].power_x1000,
         (unsigned long)s_ir.feat[1].power_x1000,
         (unsigned long)s_ir.feat[2].power_x1000,
         (unsigned long)s_ir.ratio_45_38_x1000,
         (unsigned long)s_ir.ratio_45_50_x1000,
-        (unsigned int)zcr_to_x10(s_ir.feat[0].zcr_hz),
-        (unsigned int)zcr_to_x10(s_ir.feat[1].zcr_hz),
-        (unsigned int)zcr_to_x10(s_ir.feat[2].zcr_hz),
-        (unsigned int)s_ir.zcr_dead_zone[0],
-        (unsigned int)s_ir.zcr_dead_zone[1],
-        (unsigned int)s_ir.zcr_dead_zone[2],
+        (unsigned int)s_ir.feat[0].dominant_freq_x10,
+        (unsigned int)s_ir.feat[1].dominant_freq_x10,
+        (unsigned int)s_ir.feat[2].dominant_freq_x10,
+        (unsigned int)s_ir.feat[0].band_ratio_x1000,
+        (unsigned int)s_ir.feat[1].band_ratio_x1000,
+        (unsigned int)s_ir.feat[2].band_ratio_x1000,
+        (unsigned int)s_ir.feat[0].core_ratio_x1000,
+        (unsigned int)s_ir.feat[1].core_ratio_x1000,
+        (unsigned int)s_ir.feat[2].core_ratio_x1000,
+        (unsigned int)s_ir.feat[0].peak_support_x1000,
+        (unsigned int)s_ir.feat[1].peak_support_x1000,
+        (unsigned int)s_ir.feat[2].peak_support_x1000,
+        (unsigned long)s_ir.feat[0].band_magnitude_sum,
+        (unsigned long)s_ir.feat[1].band_magnitude_sum,
+        (unsigned long)s_ir.feat[2].band_magnitude_sum,
+        (unsigned long)fft_ratio_38,
+        (unsigned long)fft_ratio_50,
+        (unsigned int)ref_a_valid,
+        (unsigned int)ref_b_valid,
         (unsigned long)s_ir.valid_accum_ms,
         (unsigned long)s_ir.confirm_ms,
         (unsigned int)((s_ir.power_drop_active != 0U) ||
                        (s_ir.criteria_drop_active != 0U)),
-        (unsigned int)reference_zcr_valid(&s_ir, IR_CH_REF_A),
-        (unsigned int)reference_zcr_valid(&s_ir, IR_CH_REF_B),
         s_ir.profile_enabled ? ir_profile_name(s_ir.profile.state) : "OFF");
 }
 
@@ -510,135 +557,6 @@ static void remove_dc(int32_t *buf, uint16_t len)
     }
 }
 
-static uint16_t calculate_zcr_noise_p90(uint32_t ch)
-{
-    int32_t work[IR_ZCR_CAL_WINDOW_SAMPLES];
-    const uint16_t index = (uint16_t)(((IR_ZCR_CAL_WINDOW_SAMPLES *
-                                       IR_ZCR_NOISE_PERCENTILE + 99U) / 100U) - 1U);
-
-    history_to_workbuf(&s_ir.history[ch], work, IR_ZCR_CAL_WINDOW_SAMPLES);
-    remove_dc(work, IR_ZCR_CAL_WINDOW_SAMPLES);
-
-    /* P90使用绝对交流幅度，忽略最顶部10%的偶发毛刺。 */
-    for (uint16_t i = 0U; i < IR_ZCR_CAL_WINDOW_SAMPLES; i++) {
-        int64_t sample = work[i];
-        uint64_t magnitude = (uint64_t)((sample < 0) ? -sample : sample);
-        work[i] = (magnitude > UINT16_MAX) ? UINT16_MAX : (int32_t)magnitude;
-    }
-    for (uint16_t i = 1U; i < IR_ZCR_CAL_WINDOW_SAMPLES; i++) {
-        int32_t value = work[i];
-        uint16_t j = i;
-        while ((j > 0U) && (work[j - 1U] > value)) {
-            work[j] = work[j - 1U];
-            j--;
-        }
-        work[j] = value;
-    }
-
-    return (uint16_t)work[index];
-}
-
-static uint16_t median_zcr_noise(const uint16_t values[IR_ZCR_CAL_WINDOW_COUNT])
-{
-    uint16_t sorted[IR_ZCR_CAL_WINDOW_COUNT];
-    memcpy(sorted, values, sizeof(sorted));
-
-    /* 5个窗口取中位数，避免某一个窗口的环境扰动永久写入EEPROM。 */
-    for (uint32_t i = 1U; i < IR_ZCR_CAL_WINDOW_COUNT; i++) {
-        uint16_t value = sorted[i];
-        uint32_t j = i;
-        while ((j > 0U) && (sorted[j - 1U] > value)) {
-            sorted[j] = sorted[j - 1U];
-            j--;
-        }
-        sorted[j] = value;
-    }
-    return sorted[IR_ZCR_CAL_WINDOW_COUNT / 2U];
-}
-
-static void finish_zcr_calibration(void)
-{
-    AP_EEPROM_IR_Param_t candidate = *AP_EEPROM_IR_Get();
-
-    for (uint32_t ch = 0U; ch < IR_CH_NUM; ch++) {
-        uint32_t dead_zone = (uint32_t)(((uint64_t)median_zcr_noise(
-                                            s_zcr_cal.p90_window[ch]) *
-                                        IR_ZCR_NOISE_GAIN_NUM +
-                                        IR_ZCR_NOISE_GAIN_DEN - 1U) /
-                                       IR_ZCR_NOISE_GAIN_DEN);
-        if (dead_zone < IR_ZCR_DEAD_ZONE_MIN) dead_zone = IR_ZCR_DEAD_ZONE_MIN;
-        /* 手动标定仍限制在10~30，防止强扰动窗口屏蔽真实火焰过零。 */
-        if (dead_zone > IR_ZCR_DEAD_ZONE_MAX) dead_zone = IR_ZCR_DEAD_ZONE_MAX;
-        candidate.zcr_dead_zone[ch] = dead_zone;
-    }
-
-    /* EEPROM写入成功后才切换运行参数，保证掉电配置与当前判据一致。 */
-    if (AP_EEPROM_IR_Save(&candidate) != 0) {
-        s_zcr_cal.state = AP_IR_ZCR_CAL_ERROR;
-        DBG("ZCR_CAL save failed; keep DZ=%u,%u,%u",
-            (unsigned int)s_ir.zcr_dead_zone[0],
-            (unsigned int)s_ir.zcr_dead_zone[1],
-            (unsigned int)s_ir.zcr_dead_zone[2]);
-        return;
-    }
-
-    for (uint32_t ch = 0U; ch < IR_CH_NUM; ch++) {
-        s_ir.zcr_dead_zone[ch] = (uint16_t)candidate.zcr_dead_zone[ch];
-    }
-    s_ir.dead_zone_ready = 1U;
-    s_zcr_cal.state = AP_IR_ZCR_CAL_DONE;
-    DBG("ZCR_CAL saved DZ=%u,%u,%u",
-        (unsigned int)s_ir.zcr_dead_zone[0],
-        (unsigned int)s_ir.zcr_dead_zone[1],
-        (unsigned int)s_ir.zcr_dead_zone[2]);
-}
-
-static void process_zcr_calibration(uint32_t now)
-{
-    if (s_zcr_cal.state == AP_IR_ZCR_CAL_WARMUP) {
-        if ((now - s_zcr_cal.phase_start_ms) < IR_ZCR_CAL_WARMUP_MS) return;
-
-        /* 预热结束后再完整等待2秒，确保第一个窗口不包含启动阶段数据。 */
-        s_zcr_cal.state = AP_IR_ZCR_CAL_COLLECTING;
-        s_zcr_cal.next_window_ms = now +
-            (IR_ZCR_CAL_WINDOW_SAMPLES * 1000U / (uint32_t)IR_SAMPLE_RATE_HZ);
-        DBG("ZCR_CAL collecting %u windows",
-            (unsigned int)IR_ZCR_CAL_WINDOW_COUNT);
-        return;
-    }
-
-    if (s_zcr_cal.state != AP_IR_ZCR_CAL_COLLECTING) return;
-
-    /* 出现疑似火焰时终止标定，避免把火焰交流幅度保存成本底噪声。 */
-    if (s_ir.state != IR_STATE_IDLE) {
-        s_zcr_cal.state = AP_IR_ZCR_CAL_ERROR;
-        DBG("ZCR_CAL aborted: IR state=%u", (unsigned int)s_ir.state);
-        return;
-    }
-    if ((int32_t)(now - s_zcr_cal.next_window_ms) < 0) return;
-
-    for (uint32_t ch = 0U; ch < IR_CH_NUM; ch++) {
-        if (s_ir.history[ch].count < IR_ZCR_CAL_WINDOW_SAMPLES) return;
-        s_zcr_cal.p90_window[ch][s_zcr_cal.windows_collected] =
-            calculate_zcr_noise_p90(ch);
-    }
-    DBG("ZCR_CAL window=%u/%u P90=%u,%u,%u",
-        (unsigned int)(s_zcr_cal.windows_collected + 1U),
-        (unsigned int)IR_ZCR_CAL_WINDOW_COUNT,
-        (unsigned int)s_zcr_cal.p90_window[0][s_zcr_cal.windows_collected],
-        (unsigned int)s_zcr_cal.p90_window[1][s_zcr_cal.windows_collected],
-        (unsigned int)s_zcr_cal.p90_window[2][s_zcr_cal.windows_collected]);
-
-    s_zcr_cal.windows_collected++;
-    if (s_zcr_cal.windows_collected >= IR_ZCR_CAL_WINDOW_COUNT) {
-        finish_zcr_calibration();
-    } else {
-        /* 以上次实际取样时刻为起点，确保下一窗口与当前窗口不重叠。 */
-        s_zcr_cal.next_window_ms = now +
-            (IR_ZCR_CAL_WINDOW_SAMPLES * 1000U / (uint32_t)IR_SAMPLE_RATE_HZ);
-    }
-}
-
 /**
   @brief  单点二阶 IIR 低通滤波 (Butterworth 20Hz @100Hz)
           直接 I 型：
@@ -718,42 +636,280 @@ static uint32_t calc_ratio_x1000(uint32_t numerator, uint32_t denominator)
 }
 
 /**
-  @brief  计算过零率 (ZCR)
-          检测已去直流信号穿过零电平的次数
-          ZCR = 过零次数 / (2 × 窗口秒数)
-  @param  buf:  已去直流的信号 (int32_t)
-  @param  len:  数据点数
-  @param  fs:   采样率 (Hz)
-  @return 过零率 (Hz)
+  @brief  返回指定FFT级的单步旋转因子，Q30格式
+  @note   支持128/256点基2 FFT所需级长，避免引入libm或CMSIS-DSP依赖。
 */
-static float calc_zcr(const int32_t *buf, uint16_t len, float fs,
-                      uint16_t dead_zone)
+static void fft_stage_twiddle_q30(uint16_t length,
+                                  int32_t *real_q30, int32_t *imag_q30)
 {
-    uint16_t zc_count = 0;
-    int8_t last_sign = 0;
-
-    for (uint16_t i = 0; i < len; i++) {
-        int8_t sign = 0;
-        if (buf[i] > (int32_t)dead_zone) {
-            sign = 1;
-        } else if (buf[i] < -(int32_t)dead_zone) {
-            sign = -1;
-        }
-
-        if (sign == 0) continue;
-        if (last_sign != 0 && sign != last_sign) zc_count++;
-        last_sign = sign;
+    switch (length) {
+        case 2U:   *real_q30 = -1073741824L; *imag_q30 = 0L;           break;
+        case 4U:   *real_q30 = 0L;           *imag_q30 = -1073741824L; break;
+        case 8U:   *real_q30 = 759250125L;   *imag_q30 = -759250125L;  break;
+        case 16U:  *real_q30 = 992008094L;   *imag_q30 = -410903207L;  break;
+        case 32U:  *real_q30 = 1053110176L;  *imag_q30 = -209476638L;  break;
+        case 64U:  *real_q30 = 1068571464L;  *imag_q30 = -105245103L;  break;
+        case 128U: *real_q30 = 1072448455L;  *imag_q30 = -52686014L;   break;
+        case 256U: *real_q30 = 1073418433L;  *imag_q30 = -26350943L;   break;
+        default:   *real_q30 = (int32_t)IR_FFT_Q30_ONE; *imag_q30 = 0L; break;
     }
-    float window_time = (float)len / fs;
-    if (window_time <= 0.0f) return 0.0f;
-    return (float)zc_count / (2.0f * window_time);
 }
 
-static uint16_t zcr_to_x10(float zcr_hz)
+/**
+  @brief  对256点去直流信号执行周期Hann加窗和定点基2 FFT
+  @param  buf: 已去直流的连续256点信号
+  @note   FFT数据保持ADC幅度量级，蝶形中间使用64位乘积，不需要
+          每级缩放。Hann窗降低2.56秒非整周期火焰波动的频谱泄漏。
+ */
+static void fft_execute(const int32_t *buf)
 {
-    if (zcr_hz <= 0.0f) return 0U;
-    if (zcr_hz >= 6553.5f) return UINT16_MAX;
-    return (uint16_t)(zcr_hz * 10.0f + 0.5f);
+    int32_t window_cos_q30 = (int32_t)IR_FFT_Q30_ONE;
+    int32_t window_sin_q30 = 0L;
+    /* 周期Hann步长为2*pi/256；常量由double离线计算并量化为Q30。 */
+    const int32_t step_cos_q30 = 1073418433L;
+    const int32_t step_sin_q30 = 26350943L;
+
+    for (uint16_t i = 0U; i < IR_FFT_WINDOW_SIZE; i++) {
+        int32_t hann_q30 = (int32_t)((IR_FFT_Q30_ONE - window_cos_q30) / 2LL);
+        s_fft_real[i] = (int32_t)(((int64_t)buf[i] * hann_q30) >> 30);
+        s_fft_imag[i] = 0L;
+
+        int32_t next_cos = (int32_t)(((int64_t)window_cos_q30 * step_cos_q30 -
+                                      (int64_t)window_sin_q30 * step_sin_q30) >> 30);
+        int32_t next_sin = (int32_t)(((int64_t)window_sin_q30 * step_cos_q30 +
+                                      (int64_t)window_cos_q30 * step_sin_q30) >> 30);
+        window_cos_q30 = next_cos;
+        window_sin_q30 = next_sin;
+    }
+
+    /* 就地位逆序：使后续每级蝶形可按连续内存访问。 */
+    for (uint16_t i = 1U, j = 0U; i < IR_FFT_WINDOW_SIZE; i++) {
+        uint16_t bit = IR_FFT_WINDOW_SIZE >> 1U;
+        while ((j & bit) != 0U) {
+            j ^= bit;
+            bit >>= 1U;
+        }
+        j ^= bit;
+        if (i < j) {
+            int32_t tmp = s_fft_real[i];
+            s_fft_real[i] = s_fft_real[j];
+            s_fft_real[j] = tmp;
+            tmp = s_fft_imag[i];
+            s_fft_imag[i] = s_fft_imag[j];
+            s_fft_imag[j] = tmp;
+        }
+    }
+
+    for (uint16_t length = 2U; length <= IR_FFT_WINDOW_SIZE; length <<= 1U) {
+        int32_t step_real_q30;
+        int32_t step_imag_q30;
+        fft_stage_twiddle_q30(length, &step_real_q30, &step_imag_q30);
+
+        for (uint16_t base = 0U; base < IR_FFT_WINDOW_SIZE; base += length) {
+            int32_t tw_real_q30 = (int32_t)IR_FFT_Q30_ONE;
+            int32_t tw_imag_q30 = 0L;
+            uint16_t half = length >> 1U;
+
+            for (uint16_t j = 0U; j < half; j++) {
+                uint16_t even = base + j;
+                uint16_t odd = even + half;
+                int32_t odd_real = (int32_t)(((int64_t)tw_real_q30 * s_fft_real[odd] -
+                                              (int64_t)tw_imag_q30 * s_fft_imag[odd]) >> 30);
+                int32_t odd_imag = (int32_t)(((int64_t)tw_real_q30 * s_fft_imag[odd] +
+                                              (int64_t)tw_imag_q30 * s_fft_real[odd]) >> 30);
+                int32_t even_real = s_fft_real[even];
+                int32_t even_imag = s_fft_imag[even];
+
+                s_fft_real[even] = even_real + odd_real;
+                s_fft_imag[even] = even_imag + odd_imag;
+                s_fft_real[odd] = even_real - odd_real;
+                s_fft_imag[odd] = even_imag - odd_imag;
+
+                int32_t next_real = (int32_t)(((int64_t)tw_real_q30 * step_real_q30 -
+                                                (int64_t)tw_imag_q30 * step_imag_q30) >> 30);
+                int32_t next_imag = (int32_t)(((int64_t)tw_imag_q30 * step_real_q30 +
+                                                (int64_t)tw_real_q30 * step_imag_q30) >> 30);
+                tw_real_q30 = next_real;
+                tw_imag_q30 = next_imag;
+            }
+        }
+    }
+}
+
+static uint16_t fft_bin_ceil(uint16_t freq_x10)
+{
+    uint32_t numerator = (uint32_t)freq_x10 * IR_FFT_WINDOW_SIZE;
+    uint16_t bin = (uint16_t)((numerator + IR_SAMPLE_RATE_HZ_X10 - 1U) /
+                              IR_SAMPLE_RATE_HZ_X10);
+    return (bin < 1U) ? 1U : bin;
+}
+
+static uint16_t fft_bin_floor(uint16_t freq_x10)
+{
+    uint16_t bin = (uint16_t)(((uint32_t)freq_x10 * IR_FFT_WINDOW_SIZE) /
+                              IR_SAMPLE_RATE_HZ_X10);
+    uint16_t max_bin = (IR_FFT_WINDOW_SIZE / 2U) - 1U;
+    return (bin > max_bin) ? max_bin : bin;
+}
+
+/**
+  @brief  计算64位非负整数平方根的整数部分
+  @note   专利使用FFT幅值和而不是功率谱和，因此需要sqrt(Re^2+Im^2)。
+          二进制逐位算法固定32轮、无浮点和除法，适合无FPU的Cortex-M3。
+ */
+static uint32_t integer_sqrt_u64(uint64_t value)
+{
+    uint64_t remainder = 0ULL;
+    uint64_t root = 0ULL;
+
+    for (uint32_t i = 0U; i < 32U; i++) {
+        root <<= 1U;
+        remainder = (remainder << 2U) | (value >> 62U);
+        value <<= 2U;
+        uint64_t trial = (root << 1U) | 1ULL;
+        if (remainder >= trial) {
+            remainder -= trial;
+            root++;
+        }
+    }
+    return (uint32_t)root;
+}
+
+/**
+  @brief  从一个FFT窗口提取主频和两个归一化频带特征
+  @note   band_ratio表示用户配置频带占全部非直流能量的比例；
+          core_ratio表示1.5Hz以上能量占约1Hz~上限频带的比例。现场有效火焰主频常落在
+          1.6~4Hz，因此不能再把1.5~3Hz一概视为慢扰动；它仍会排除接近直流
+          的极慢温漂。两者均归一化，不随灵敏度调整。
+*/
+static void calculate_fft_features(const int32_t *buf, IR_Features_t *feature,
+                                   uint16_t freq_low_x10,
+                                   uint16_t freq_high_x10)
+{
+    uint64_t total_energy = 0ULL;
+    uint64_t band_energy = 0ULL;
+    uint64_t core_energy = 0ULL;
+    uint64_t all_peak_energy = 0ULL;
+    uint64_t band_peak_energy = 0ULL;
+    uint64_t band_magnitude_sum = 0ULL;
+    uint16_t dominant_bin = 0U;
+    uint16_t low_bin = fft_bin_floor(freq_low_x10);
+    uint16_t high_bin = fft_bin_floor(freq_high_x10);
+    uint16_t core_low_x10 = (freq_low_x10 > IR_FFT_CORE_LOW_X10)
+                          ? freq_low_x10 : IR_FFT_CORE_LOW_X10;
+    uint16_t core_low_bin = fft_bin_ceil(core_low_x10);
+
+    /*
+     * 256点FFT中bin2=0.78125Hz、bin3=1.171875Hz、bin4=1.5625Hz。
+     * 配置1Hz下限按向下取整包含bin2，使FB表示约1~20Hz占全频的比例；
+     * FC分子按向上取整从bin4开始，使FC表示约1.5~20Hz占1~20Hz的比例。
+     * 两个边界不再量化到同一频点，可直接观察0.8/1.2/1.6Hz能量分布。
+     */
+    if (low_bin < 1U) low_bin = 1U;
+
+    fft_execute(buf);
+
+    /* 配置范围可能小于一个FFT频点；此时明确返回无效特征，
+       避免无符号频点上下界倒置后意外累加能量。 */
+    if (high_bin < low_bin) {
+        feature->dominant_freq_x10 = 0U;
+        feature->band_ratio_x1000 = 0U;
+        feature->core_ratio_x1000 = 0U;
+        feature->peak_support_x1000 = 0U;
+        feature->band_magnitude_sum = 0U;
+        return;
+    }
+
+    for (uint16_t bin = 1U; bin < (IR_FFT_WINDOW_SIZE / 2U); bin++) {
+        int64_t real = s_fft_real[bin];
+        int64_t imag = s_fft_imag[bin];
+        uint64_t energy = (uint64_t)(real * real + imag * imag);
+        total_energy += energy;
+
+        if (energy > all_peak_energy) all_peak_energy = energy;
+        if (bin >= low_bin && bin <= high_bin) {
+            band_energy += energy;
+            band_magnitude_sum += integer_sqrt_u64(energy);
+            /* 按专利定义在目标火焰频带Ω内寻找峰值主频。 */
+            if (energy > band_peak_energy) {
+                band_peak_energy = energy;
+                dominant_bin = bin;
+            }
+            if (bin >= core_low_bin) core_energy += energy;
+        }
+    }
+
+    feature->dominant_freq_x10 = (uint16_t)(
+        ((uint32_t)dominant_bin * IR_SAMPLE_RATE_HZ_X10 +
+         IR_FFT_WINDOW_SIZE / 2U) / IR_FFT_WINDOW_SIZE);
+    feature->band_ratio_x1000 = (total_energy == 0ULL) ? 0U :
+        (uint16_t)((band_energy * 1000ULL) / total_energy);
+    feature->core_ratio_x1000 = (band_energy == 0ULL) ? 0U :
+        (uint16_t)((core_energy * 1000ULL) / band_energy);
+    feature->peak_support_x1000 = (all_peak_energy == 0ULL) ? 0U :
+        (uint16_t)((band_peak_energy * 1000ULL) / all_peak_energy);
+    feature->band_magnitude_sum = (band_magnitude_sum > UINT32_MAX)
+                                ? UINT32_MAX : (uint32_t)band_magnitude_sum;
+}
+
+/**
+  @brief  按10Hz更新三通道FFT特征
+  @note   功率和状态机仍保持10ms周期；FFT结果最多滞后100ms，避免
+          Cortex-M3在每个10ms周期重复计算高度重叠的三组频谱。
+*/
+static void update_fft_features(IR_Detector_t *d, uint32_t now)
+{
+    if (d->fft_ready != 0U &&
+        (now - d->fft_last_update_ms) < IR_FFT_UPDATE_MS) return;
+
+    for (uint32_t ch = 0U; ch < IR_CH_NUM; ch++) {
+        /*
+         * 4.5um主通道始终计算FFT，是火焰频率特征的强制来源。
+         * 参考通道只有均方功率达到有效下限时才计算；否则清除旧频谱，
+         * 防止上一个强信号窗口的主频残留并错误参与当前一致性判断。
+         */
+        if (ch != IR_CH_MAIN && !reference_power_valid(d, ch)) {
+            d->feat[ch].dominant_freq_x10 = 0U;
+            d->feat[ch].band_ratio_x1000 = 0U;
+            d->feat[ch].core_ratio_x1000 = 0U;
+            d->feat[ch].peak_support_x1000 = 0U;
+            d->feat[ch].band_magnitude_sum = 0U;
+            d->feat[ch].fft_valid = 0U;
+            continue;
+        }
+        history_to_workbuf(&d->history[ch], s_fft_input, IR_FFT_WINDOW_SIZE);
+        remove_dc(s_fft_input, IR_FFT_WINDOW_SIZE);
+        calculate_fft_features(s_fft_input, &d->feat[ch],
+                               d->freq_low_x10, d->freq_high_x10);
+        d->feat[ch].fft_valid = 1U;
+    }
+    d->fft_last_update_ms = now;
+    d->fft_ready = 1U;
+}
+
+/**
+  @brief  判断参考通道当前功率是否足以提供可信FFT特征
+  @param  d: 检测器实例
+  @param  ch: IR_CH_REF_A或IR_CH_REF_B
+  @retval true: 参考通道达到对应有效功率下限，可计算并参与频域一致性
+  @note   两个门槛沿用原ZCR参考有效性的功率口径900/400，但不再依赖死区。
+          主通道不调用本函数，4.5um频域判据始终强制执行。
+ */
+static bool reference_power_valid(const IR_Detector_t *d, uint32_t ch)
+{
+    uint32_t threshold = (ch == IR_CH_REF_A)
+                       ? IR_FFT_REF_A_POWER_MIN : IR_FFT_REF_B_POWER_MIN;
+    return d->feat[ch].power_x1000 >= threshold;
+}
+
+/**
+  @brief  返回参考通道最近一次完整FFT刷新时锁存的有效状态
+  @note   不能直接使用当前10ms功率判断，因为FFT只每100ms刷新；锁存可防止
+          功率刚跨过门槛时，用尚未计算或已经清零的频谱参与一致性判断。
+ */
+static bool reference_fft_valid(const IR_Detector_t *d, uint32_t ch)
+{
+    return d->feat[ch].fft_valid != 0U;
 }
 
 /* ========================================================================== */
@@ -790,70 +946,84 @@ static bool check_spectral_criteria(IR_Detector_t *d)
 }
 
 /**
-  @brief  判断参考通道当前功率是否足以支撑ZCR一致性判定
-          均方值与幅度平方同量纲，以2倍标定死区的平方作为有效下限，
-          避免刚越过死区的弱参考信号将噪声ZCR当成真实频率。
-  @param  d: 检测器实例
-  @param  ch: 参考通道索引，只允许传入IR_CH_REF_A或IR_CH_REF_B
-  @retval true: 参考通道功率足以参与频率一致性判断
-  @retval false: 参考通道过弱，本周期跳过该通道一致性判断
- */
-static bool reference_zcr_valid(const IR_Detector_t *d, uint32_t ch)
-{
-    uint32_t valid_rms = (uint32_t)d->zcr_dead_zone[ch] * IR_REF_ZCR_RMS_GAIN;
-    uint32_t valid_power = valid_rms * valid_rms;
-    return d->feat[ch].power_x1000 >= valid_power;
-}
-
-/**
-  @brief  检查ZCR范围和三通道频率一致性
-          频率来自2秒滚动窗口，同时用于IDLE入态和WARNING证据维持。
-  @param  d: 检测器实例，读取当前ZCR、功率、死区和频率配置
-  @param  warning_hold: false使用严格入态频带；true将上下限各放宽一个ZCR量化档
-  @retval true: 主通道在频带内，且所有有效参考通道满足一致性
-  @retval false: 主频率越界，或任一有效参考通道与主通道差值超过上限
+  @brief  检查主通道FFT火焰频域特征
+  @param  d: 检测器实例，读取当前FFT特征和固定频率范围
+  @param  warning_hold: false使用严格入态门槛；true仅放宽频率上限和比例门槛
+  @retval true: 主通道满足火焰频域特征，所有当前有效参考通道与主频一致
+  @retval false: 频谱尚未就绪、主频越界或能量分布不符合火焰波动
+  @note   4.5um主通道始终参与；3.8/5.0um只有达到各自有效功率下限时
+          才计算FFT并参与一致性，弱参考信号不会因噪声主频否决火焰。
  */
 static bool check_frequency_criteria(IR_Detector_t *d, bool warning_hold)
 {
-    /* ④ 过零率在频率范围内 */
-    {
-        uint16_t zcr_x10 = zcr_to_x10(d->feat[IR_CH_MAIN].zcr_hz);
-        uint16_t low_x10 = d->freq_low_x10;
-        uint16_t high_x10 = d->freq_high_x10;
-        if (warning_hold) {
-            low_x10 = (low_x10 > IR_ZCR_HOLD_MARGIN_X10)
-                        ? (uint16_t)(low_x10 - IR_ZCR_HOLD_MARGIN_X10) : 0U;
-            high_x10 = (high_x10 <= UINT16_MAX - IR_ZCR_HOLD_MARGIN_X10)
-                         ? (uint16_t)(high_x10 + IR_ZCR_HOLD_MARGIN_X10) : UINT16_MAX;
-        }
-        if (zcr_x10 < low_x10 || zcr_x10 > high_x10) {
-            DBG_CRITERION("criterion-4 Z10=%lu not in [%lu,%lu] hold=%u",
-                (unsigned long)zcr_x10,
-                (unsigned long)low_x10,
-                (unsigned long)high_x10,
-                (unsigned int)warning_hold);
-            return false;
-        }
+    const IR_Features_t *main = &d->feat[IR_CH_MAIN];
+    uint16_t low_x10 = d->freq_low_x10;
+    uint16_t high_x10 = d->freq_high_x10;
+    uint16_t band_ratio_min = IR_FFT_BAND_RATIO_MIN_X1000;
+    uint16_t core_ratio_min = IR_FFT_CORE_RATIO_MIN_X1000;
+    uint16_t peak_support_min = IR_FFT_PEAK_SUPPORT_MIN_X1000;
+
+    if (d->fft_ready == 0U) return false;
+    if (warning_hold) {
+        /* 256点已能区分0.8/1.2/1.6Hz。WARNING不再下放主频下限，确保
+           4.5um始终满足配置的最低火焰频率；只放宽上限和三个比例门槛。 */
+        high_x10 = (high_x10 <= UINT16_MAX - IR_FFT_BIN_WIDTH_X10)
+                     ? (uint16_t)(high_x10 + IR_FFT_BIN_WIDTH_X10) : UINT16_MAX;
+        band_ratio_min = IR_FFT_HOLD_BAND_RATIO_MIN_X1000;
+        core_ratio_min = IR_FFT_HOLD_CORE_RATIO_MIN_X1000;
+        peak_support_min = IR_FFT_HOLD_PEAK_SUPPORT_MIN_X1000;
     }
 
-    /* ⑤ 频率一致性：仅有效参考通道参与，弱参考信号的噪声ZCR不得否决火焰。 */
-    {
-        uint16_t zcr_main = zcr_to_x10(d->feat[IR_CH_MAIN].zcr_hz);
-        uint16_t zcr_refa = zcr_to_x10(d->feat[IR_CH_REF_A].zcr_hz);
-        uint16_t zcr_refb = zcr_to_x10(d->feat[IR_CH_REF_B].zcr_hz);
-        uint16_t diff_a = (zcr_main >= zcr_refa) ? (zcr_main - zcr_refa)
-                                                  : (zcr_refa - zcr_main);
-        uint16_t diff_b = (zcr_main >= zcr_refb) ? (zcr_main - zcr_refb)
-                                                  : (zcr_refb - zcr_main);
-        bool refa_valid = reference_zcr_valid(d, IR_CH_REF_A);
-        bool refb_valid = reference_zcr_valid(d, IR_CH_REF_B);
-        /* 差值上限本身允许通过，仅超过2.0Hz才视为不一致。 */
-        if ((refa_valid && diff_a > IR_FREQ_CONSISTENCY_X10) ||
-            (refb_valid && diff_b > IR_FREQ_CONSISTENCY_X10)) {
-            DBG_CRITERION("criterion-5 dZ10 main-38=%u main-50=%u REFV=%u,%u limit=%u",
-                          (unsigned int)diff_a, (unsigned int)diff_b,
-                          (unsigned int)refa_valid, (unsigned int)refb_valid,
-                          (unsigned int)IR_FREQ_CONSISTENCY_X10);
+    /* ④ 按专利口径，主频是在配置火焰频带内功率谱最大的频点。 */
+    if (main->dominant_freq_x10 < low_x10 ||
+        main->dominant_freq_x10 > high_x10) {
+        DBG_CRITERION("criterion-4 F10=%u not in [%u,%u] hold=%u",
+                      (unsigned int)main->dominant_freq_x10,
+                      (unsigned int)low_x10,
+                      (unsigned int)high_x10,
+                      (unsigned int)warning_hold);
+        return false;
+    }
+
+    /*
+     * ⑤ 频带结构判据：大部分能量要在火焰频带内，且至少有一定比例
+     * 分布在1.5Hz以上；带内峰值还必须获得全频最大峰值的足够支持。
+     * 这会保留现场常见的1.6~4Hz火焰，同时抑制接近直流的慢温漂。
+     */
+    if (main->band_ratio_x1000 < band_ratio_min ||
+        main->core_ratio_x1000 < core_ratio_min ||
+        main->peak_support_x1000 < peak_support_min) {
+        DBG_CRITERION("criterion-5 FFT ratio FB=%u/%u FC=%u/%u FP=%u/%u hold=%u",
+                      (unsigned int)main->band_ratio_x1000,
+                      (unsigned int)band_ratio_min,
+                      (unsigned int)main->core_ratio_x1000,
+                      (unsigned int)core_ratio_min,
+                      (unsigned int)main->peak_support_x1000,
+                      (unsigned int)peak_support_min,
+                      (unsigned int)warning_hold);
+        return false;
+    }
+
+    /*
+     * ⑥ 有效参考通道应与4.5um观察到同一火焰闪烁节律。
+     * 无效参考通道直接跳过；若两个参考通道都无效，主通道频域特征仍可独立通过，
+     * 以免远距离弱火只在4.5um通道有明显响应时发生漏报。
+     */
+    const uint32_t ref_channels[2] = {IR_CH_REF_A, IR_CH_REF_B};
+    for (uint32_t i = 0U; i < 2U; i++) {
+        uint32_t ch = ref_channels[i];
+        if (!reference_fft_valid(d, ch)) continue;
+
+        uint16_t ref_freq = d->feat[ch].dominant_freq_x10;
+        uint16_t diff = (main->dominant_freq_x10 >= ref_freq)
+                      ? (uint16_t)(main->dominant_freq_x10 - ref_freq)
+                      : (uint16_t)(ref_freq - main->dominant_freq_x10);
+        if (diff > IR_FFT_REF_DIFF_MAX_X10) {
+            DBG_CRITERION("criterion-6 dF10 main-ref%lu=%u limit=%u REFV=%u,%u",
+                          (unsigned long)ch, (unsigned int)diff,
+                          (unsigned int)IR_FFT_REF_DIFF_MAX_X10,
+                          (unsigned int)reference_fft_valid(d, IR_CH_REF_A),
+                          (unsigned int)reference_fft_valid(d, IR_CH_REF_B));
             return false;
         }
     }
@@ -863,7 +1033,7 @@ static bool check_frequency_criteria(IR_Detector_t *d, bool warning_hold)
 
 static bool check_entry_criteria(IR_Detector_t *d)
 {
-    /* 入态要求光谱、主ZCR及所有有效参考通道的频率一致性通过。 */
+    /* 入态要求光谱比和主通道FFT频域特征同时通过。 */
     return check_spectral_criteria(d) && check_frequency_criteria(d, false);
 }
 
@@ -953,7 +1123,7 @@ static void ignition_profile_release_if_quiet(IR_Detector_t *d, uint32_t now,
   @param  now: 当前毫秒tick
   @param  power: 首次达到ON的4.5um滚动均方值
 
-  该函数由独立PROFILE监视器调用，不依赖光谱、ZCR或IR状态机是否已进入
+  该函数由独立PROFILE监视器调用，不依赖光谱、FFT或IR状态机是否已进入
   WARNING。这样可在五判据尚未满足时捕获真实点火峰值，避免日志中点火峰值
   已经衰减数秒后才以WARNING入口作为错误起点。
  */
@@ -1044,13 +1214,13 @@ static uint32_t ignition_profile_duty_x1000(uint16_t high_samples,
   LIGHTER不是永久锁存结论。分类完成后按1秒窗口继续观察主通道，但均值只统计
   P45>=OFF的有效样本，低谷样本仅计入窗口总数以形成DUTY1000。由于30cm酒精盆
   点火瞬间可能出现170万级轰燃峰值，后续真实稳定火焰即使维持6万~几十万，
-  相对启动峰值也可能远低于40%，因此必须保留固定5万的绝对恢复路径。同时，
+  相对启动峰值也可能远低于30%，因此必须保留固定5万的绝对恢复路径。同时，
   固定阈值会受距离、镜片透过率和器件增益影响，远距离真实火焰可能达不到5万，
-  因此也保留恢复到启动峰值40%以上的相对路径，两条能量路径使用或关系。
+  因此也保留恢复到启动峰值30%以上的相对路径，两条路径独立累计。
 
-  无论通过绝对路径还是相对路径，都要求有效占比>=60%，并连续通过2个1秒窗口
-  后才允许LIGHTER单向升级为SUSTAINED。第一次通过只累计确认次数；任一窗口
-  不通过便清零，可防止近距离打火机偶发一个窗口超过5万时被误升级。
+  相对路径连续2个1秒窗口通过即可升级；固定5万路径必须连续5窗通过，避免近距离
+  打火机仅凭较高的稳定能量在2秒内被误升级。每条路径任一窗口不通过只清除自身
+  连续计数；任一路径完成后均只允许LIGHTER单向升级为SUSTAINED。
 
   同时保留连续低于OFF满2秒的释放规则；因此打火机熄灭会先回BYPASS，而不会
   因为低谷样本被平均进去产生虚假的恢复结论。
@@ -1065,7 +1235,7 @@ static void ignition_profile_recover_sustained(IR_Detector_t *d,
     uint32_t duty_x1000;
     bool absolute_pass;
     bool relative_pass;
-    bool window_pass;
+    bool duty_pass;
 
     ignition_profile_release_if_quiet(d, now, power);
     if (profile->state != IR_PROFILE_LIGHTER) return;
@@ -1088,48 +1258,57 @@ static void ignition_profile_recover_sustained(IR_Detector_t *d,
     duty_x1000 = ignition_profile_duty_x1000(
         profile->late_high_samples, profile->late_samples);
 
-    /*
-     * 绝对能量和相对恢复使用或关系，避免任何单一标尺覆盖全部距离和硬件差异：
-     *   - absolute_pass处理巨大轰燃峰值后仍稳定在5万以上的真实火焰；
-     *   - relative_pass处理整体幅值偏小、但相对启动峰值恢复明显的真实火焰。
-     * 两条路径共同受有效样本和占空比约束，再由连续窗口计数过滤偶发越线。
-     */
+    /* 两条路径共享有效占空比约束，但各自独立计数，不能用一次绝对越线
+       接续上一次相对越线。这样既保留尺度适应性，也限制固定阈值误升级。 */
     absolute_pass = valid_mean >= IR_PROFILE_RECOVERY_POWER_MIN;
-    relative_pass = ratio_x1000 >= IR_PROFILE_DECAY_RATIO_X1000;
-    window_pass = (profile->late_high_samples != 0U) &&
-                  (absolute_pass || relative_pass) &&
-                  (duty_x1000 >= IR_PROFILE_RECOVERY_DUTY_X1000);
-    if (window_pass) {
-        if (profile->recovery_pass_windows <
-            IR_PROFILE_RECOVERY_CONFIRM_WINDOWS) {
-            profile->recovery_pass_windows++;
+    relative_pass = ratio_x1000 >= IR_PROFILE_RECOVERY_RATIO_X1000;
+    duty_pass = (profile->late_high_samples != 0U) &&
+                (duty_x1000 >= IR_PROFILE_RECOVERY_DUTY_X1000);
+
+    if (duty_pass && relative_pass) {
+        if (profile->recovery_relative_windows < IR_PROFILE_RECOVERY_REL_WINDOWS) {
+            profile->recovery_relative_windows++;
         }
     } else {
-        profile->recovery_pass_windows = 0U;
+        profile->recovery_relative_windows = 0U;
     }
 
-    if (profile->recovery_pass_windows >=
-        IR_PROFILE_RECOVERY_CONFIRM_WINDOWS) {
+    if (duty_pass && absolute_pass) {
+        if (profile->recovery_absolute_windows < IR_PROFILE_RECOVERY_ABS_WINDOWS) {
+            profile->recovery_absolute_windows++;
+        }
+    } else {
+        profile->recovery_absolute_windows = 0U;
+    }
+
+    if (profile->recovery_relative_windows >= IR_PROFILE_RECOVERY_REL_WINDOWS ||
+        profile->recovery_absolute_windows >= IR_PROFILE_RECOVERY_ABS_WINDOWS) {
         profile->state = IR_PROFILE_SUSTAINED;
         profile->low_power_accum_ms = 0U;
-        DBG("T%lu PROFILE LIGHTER -> SUSTAINED MEAN=%lu RMIN=%lu R1000=%lu ABS=%u REL=%u DUTY1000=%lu HIT=%u/%u PEAK=%lu",
+        DBG("T%lu PROFILE LIGHTER -> SUSTAINED MEAN=%lu RMIN=%lu R1000=%lu RTH=%u ABS=%u REL=%u DUTY1000=%lu RHIT=%u/%u AHIT=%u/%u PEAK=%lu",
             (unsigned long)now, (unsigned long)valid_mean,
             (unsigned long)IR_PROFILE_RECOVERY_POWER_MIN,
             (unsigned long)ratio_x1000,
+            (unsigned int)IR_PROFILE_RECOVERY_RATIO_X1000,
             (unsigned int)absolute_pass, (unsigned int)relative_pass,
             (unsigned long)duty_x1000,
-            (unsigned int)profile->recovery_pass_windows,
-            (unsigned int)IR_PROFILE_RECOVERY_CONFIRM_WINDOWS,
+            (unsigned int)profile->recovery_relative_windows,
+            (unsigned int)IR_PROFILE_RECOVERY_REL_WINDOWS,
+            (unsigned int)profile->recovery_absolute_windows,
+            (unsigned int)IR_PROFILE_RECOVERY_ABS_WINDOWS,
             (unsigned long)profile->early_peak);
     } else {
-        DBG("T%lu PROFILE recovery pending MEAN=%lu RMIN=%lu R1000=%lu ABS=%u REL=%u DUTY1000=%lu HIT=%u/%u VALID=%u/%u",
+        DBG("T%lu PROFILE recovery pending MEAN=%lu RMIN=%lu R1000=%lu RTH=%u ABS=%u REL=%u DUTY1000=%lu RHIT=%u/%u AHIT=%u/%u VALID=%u/%u",
             (unsigned long)now, (unsigned long)valid_mean,
             (unsigned long)IR_PROFILE_RECOVERY_POWER_MIN,
             (unsigned long)ratio_x1000,
+            (unsigned int)IR_PROFILE_RECOVERY_RATIO_X1000,
             (unsigned int)absolute_pass, (unsigned int)relative_pass,
             (unsigned long)duty_x1000,
-            (unsigned int)profile->recovery_pass_windows,
-            (unsigned int)IR_PROFILE_RECOVERY_CONFIRM_WINDOWS,
+            (unsigned int)profile->recovery_relative_windows,
+            (unsigned int)IR_PROFILE_RECOVERY_REL_WINDOWS,
+            (unsigned int)profile->recovery_absolute_windows,
+            (unsigned int)IR_PROFILE_RECOVERY_ABS_WINDOWS,
             (unsigned int)profile->late_high_samples,
             (unsigned int)profile->late_samples);
     }
@@ -1140,7 +1319,8 @@ static void ignition_profile_recover_sustained(IR_Detector_t *d,
     profile->late_samples = 0U;
     profile->late_high_samples = 0U;
     if (profile->state == IR_PROFILE_SUSTAINED) {
-        profile->recovery_pass_windows = 0U;
+        profile->recovery_relative_windows = 0U;
+        profile->recovery_absolute_windows = 0U;
     }
 }
 
@@ -1196,7 +1376,7 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
 
     /*
      * 打火机分类必须同时满足固定峰值门槛（当前10万）、至少一个OFF以上有效
-     * 后段样本，以及LATE/PEAK<40%。该门槛不是火焰进场阈值，也不随灵敏度
+     * 后段样本，以及LATE/PEAK<50%。该门槛不是火焰进场阈值，也不随灵敏度
      * 变化。无有效后段数据时不能用低于OFF的样本证明衰减，
      * 按SUSTAINED放行，优先避免真实火焰漏报。
      */
@@ -1246,7 +1426,7 @@ static void ignition_profile_finish(IR_Detector_t *d, uint32_t now,
     - 1.5~3.0秒：最多累计1.5秒late_mean和P45>=OFF的late_duty。
 
   P45本身已经是0.5秒滚动均方值，因此early_peak不是ADC单点毛刺。按照现场
-  特征，仅当PEAK达到固定门槛、有OFF以上有效后段样本且late/peak<40%时标记为
+  特征，仅当PEAK达到固定门槛、有OFF以上有效后段样本且late/peak<50%时标记为
   LIGHTER，其他情况标记为SUSTAINED。低于OFF的样本不参与late均值，只进入
   late_duty分母。若WARNING先达到确认时间，则在FIRE迁移前使用已有数据提前
   结束稳定窗，采到多少稳定样本就使用多少。LIGHTER后续按1秒窗口检查有效能量，满足恢复幅度与占空比后只允许
@@ -1456,6 +1636,11 @@ static void warning_accumulate(IR_Detector_t *d)
     }
 }
 
+/**
+  @brief  WARNING判据掉线时回退一个10ms证据周期
+  @note   回退速度与正常累积速度一致。短暂失败会降低确认进度，但只有同一类
+          判据连续失败达到2秒，状态机才会真正退出WARNING。
+ */
 static void warning_decay(IR_Detector_t *d)
 {
     d->valid_accum_ms = (d->valid_accum_ms > IR_PROCESS_STEP_MS)
@@ -1521,12 +1706,12 @@ static bool warning_power_available(IR_Detector_t *d, uint32_t now)
 }
 
 /**
-  @brief  检查WARNING期间光谱比、主ZCR及有效参考通道频率一致性
+  @brief  检查WARNING期间光谱比和主通道FFT频域特征
   @param  d: 检测器实例
   @param  now: 当前毫秒tick，用于连续判据失效drop计时
   @retval true: 本周期全部可用判据通过，并已累计一个10ms确认周期
   @retval false: 判据处于drop宽限期，或连续失效2秒后已复位到IDLE
-  @note   短暂失败仅暂停积分，不扣除历史有效证据；恢复后从原积分继续。
+  @note   短暂失败按10ms周期回退积分；连续失效2秒后撤销WARNING。
  */
 static bool warning_criteria_available(IR_Detector_t *d, uint32_t now)
 {
@@ -1545,7 +1730,8 @@ static bool warning_criteria_available(IR_Detector_t *d, uint32_t now)
         return true;
     }
 
-    /* 单个2秒滚动窗口异常回退积分，连续失效才撤销WARNING。 */
+    /* FFT结果在100ms刷新间隔内代表当前整段频谱状态；状态机仍按真实经过的
+       10ms时间回退证据，使通过和失败具有对称积分速度。连续2秒失败撤销WARNING。 */
     warning_decay(d);
     if (d->criteria_drop_active == 0U) {
         d->criteria_drop_active = 1U;
@@ -1563,39 +1749,35 @@ static bool warning_criteria_available(IR_Detector_t *d, uint32_t now)
 
 static void AP_IR_Process(uint32_t now)
 {
-    /* 最终判定依赖2秒ZCR窗口；DC/功率仍只使用其中最近50点。 */
+    /* 最终判定依赖256点FFT窗口；DC/功率仍只使用其中最近50点。 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
-        if (s_ir.history[ch].count < IR_ZCR_WINDOW_SIZE) return;
+        if (s_ir.history[ch].count < IR_FFT_WINDOW_SIZE) return;
     }
-    /* ZCR必须使用EEPROM中经过校验的固定死区。 */
-    if (s_ir.dead_zone_ready == 0U) return;
 
 #if defined(AP_ALGO_DEBUG_ENABLE)
     if (s_debug_window_ready == 0U) {
         s_debug_window_ready = 1U;
-        DBG("T%lu WINDOW ready DC/P=%u ZCR=%u samples",
+        DBG("T%lu WINDOW ready DC/P=%u FFT=%u samples",
             (unsigned long)now,
             (unsigned int)IR_DC_POWER_WINDOW_SIZE,
-            (unsigned int)IR_ZCR_WINDOW_SIZE);
+            (unsigned int)IR_FFT_WINDOW_SIZE);
     }
 #endif
 
     /* 工作缓冲 (复用, 最大通道点数) */
-    int32_t work[IR_HISTORY_SIZE];
+    int32_t work[IR_DC_POWER_WINDOW_SIZE];
 
     /* ================================================================ */
-    /*  逐通道: 50点DC/功率与200点ZCR分别计算，避免长ZCR窗口改变功率标定。 */
+    /*  逐通道保持原50点DC/功率量纲，不因FFT替换而改变现场标定阈值。 */
     /* ================================================================ */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
         history_to_workbuf(&s_ir.history[ch], work, IR_DC_POWER_WINDOW_SIZE);
         remove_dc(work, IR_DC_POWER_WINDOW_SIZE);
         s_ir.feat[ch].power_x1000 = calc_mean_square(work, IR_DC_POWER_WINDOW_SIZE);
-
-        history_to_workbuf(&s_ir.history[ch], work, IR_ZCR_WINDOW_SIZE);
-        remove_dc(work, IR_ZCR_WINDOW_SIZE);
-        s_ir.feat[ch].zcr_hz = calc_zcr(work, IR_ZCR_WINDOW_SIZE,
-                                       IR_SAMPLE_RATE_HZ, s_ir.zcr_dead_zone[ch]);
     }
+
+    /* 三通道FFT按10Hz刷新，状态机在两次刷新之间使用最新完整频谱。 */
+    update_fft_features(&s_ir, now);
 
     /* ================================================================ */
     /*  计算光谱比，参考通道无有效功率时判定为无效                         */
@@ -1631,7 +1813,7 @@ static void AP_IR_Process(uint32_t now)
             case IR_STATE_IDLE: {
                 uint32_t power = s_ir.feat[IR_CH_MAIN].power_x1000;
 
-                /* 进入WARNING要求主功率、光谱、主ZCR及有效参考频率一致性通过。 */
+                /* 进入WARNING要求主功率、光谱比及主通道FFT频域特征通过。 */
                 if (power >= s_ir.power_threshold && check_entry_criteria(&s_ir)) {
                     s_ir.state = IR_STATE_WARNING;
                     /*
@@ -1682,8 +1864,8 @@ static void AP_IR_Process(uint32_t now)
                         s_ir.power_drop_active = 0U;
                         s_ir.criteria_drop_active = 0U;
                     }
-                } else if (s_ir.state == IR_STATE_WARNING) {    /*  && (!ignition_profile_allows_fire(&s_ir, now)) */
-                    /* 功率drop宽限期回退积分，连续低功率2秒仍由功率函数清回IDLE。 */
+                } else if (s_ir.state == IR_STATE_WARNING) {
+                    /* 功率低于OFF时按10ms回退证据；连续2秒仍由功率函数清回IDLE。 */
                     warning_decay(&s_ir);
                     s_ir.criteria_drop_start_ms = 0U;
                     s_ir.criteria_drop_active = 0U;
@@ -1724,7 +1906,6 @@ static void AP_IR_Process(uint32_t now)
 void AP_IR_Init(void)
 {
     memset(&s_ir, 0, sizeof(s_ir));
-    memset(&s_zcr_cal, 0, sizeof(s_zcr_cal));
 #if defined(AP_ALGO_DEBUG_ENABLE)
     s_debug_last_fail_ms = 0U;
     s_debug_last_snapshot_ms = 0U;
@@ -1747,19 +1928,17 @@ void AP_IR_Init(void)
                     (uint32_t)p->freq_low_x10, (uint32_t)p->freq_high_x10,
                     p->cfm_min, p->cfm_max);
 
-    /* 上电直接使用EEPROM固定死区，不再使用启动阶段ADC数据自动标定。 */
-    for (uint32_t ch = 0U; ch < IR_CH_NUM; ch++) {
-        s_ir.zcr_dead_zone[ch] = (uint16_t)p->zcr_dead_zone[ch];
-    }
-    s_ir.dead_zone_ready = 1U;
-
-    DBG("Init level=%u DC/P=%u ZCR=%u DZ=%u,%u,%u P_ON=%lu P_OFF=%lu DROP=%u CFM=%lu",
+    DBG("Init level=%u DC/P=%u FFT=%u FC_LOW=%u FB/FC/FP=%u/%u/%u HOLD=%u/%u/%u P_ON=%lu P_OFF=%lu DROP=%u CFM=%lu",
         s_ir.level,
         (unsigned int)IR_DC_POWER_WINDOW_SIZE,
-        (unsigned int)IR_ZCR_WINDOW_SIZE,
-        (unsigned int)s_ir.zcr_dead_zone[0],
-        (unsigned int)s_ir.zcr_dead_zone[1],
-        (unsigned int)s_ir.zcr_dead_zone[2],
+        (unsigned int)IR_FFT_WINDOW_SIZE,
+        (unsigned int)IR_FFT_CORE_LOW_X10,
+        (unsigned int)IR_FFT_BAND_RATIO_MIN_X1000,
+        (unsigned int)IR_FFT_CORE_RATIO_MIN_X1000,
+        (unsigned int)IR_FFT_PEAK_SUPPORT_MIN_X1000,
+        (unsigned int)IR_FFT_HOLD_BAND_RATIO_MIN_X1000,
+        (unsigned int)IR_FFT_HOLD_CORE_RATIO_MIN_X1000,
+        (unsigned int)IR_FFT_HOLD_PEAK_SUPPORT_MIN_X1000,
         (unsigned long)s_ir.power_threshold,
         (unsigned long)s_ir.power_off_threshold,
         (unsigned int)IR_POWER_DROPOUT_MS,
@@ -1802,8 +1981,6 @@ void AP_IR_Feed(void)
 {
     if (!take_feed_request()) return;
     feed_latest_sample();
-    /* 测试模式可只Feed不运行状态机，手动标定仍由主循环增量推进。 */
-    process_zcr_calibration(HAL_GetTick());
 }
 
 void AP_IR_Task(void)
@@ -1811,7 +1988,6 @@ void AP_IR_Task(void)
     if (!take_feed_request()) return;
     feed_latest_sample();
     uint32_t now = HAL_GetTick();
-    process_zcr_calibration(now);
     AP_IR_Process(now);
 }
 
@@ -1937,9 +2113,9 @@ void AP_IR_Reset(void)
     s_ir.power_active = 0;
     s_ir.power_drop_active = 0;
     s_ir.criteria_drop_active = 0;
+    s_ir.fft_last_update_ms = 0U;
+    s_ir.fft_ready = 0U;
     ignition_profile_clear(&s_ir);
-    /* 复位检测状态时取消未完成标定，但保留EEPROM固定死区。 */
-    AP_IR_CancelZcrCalibration();
     /* 清空历史窗口 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
         s_ir.history[ch].head  = 0;
@@ -1955,81 +2131,17 @@ void AP_IR_Reset(void)
     DBG("Reset -> IDLE");
 }
 
-void AP_IR_GetFeatures(uint32_t power[3], float zcr[3],
+void AP_IR_GetFeatures(uint32_t power[3], float dominant_freq[3],
                        uint32_t *r45_38, uint32_t *r45_50)
 {
     for (uint32_t i = 0; i < IR_CH_NUM; i++) {
         if (power) power[i] = s_ir.feat[i].power_x1000;
-        if (zcr)   zcr[i]   = s_ir.feat[i].zcr_hz;
+        if (dominant_freq) {
+            dominant_freq[i] = (float)s_ir.feat[i].dominant_freq_x10 / 10.0f;
+        }
     }
     if (r45_38) *r45_38 = s_ir.ratio_45_38_x1000;
     if (r45_50) *r45_50 = s_ir.ratio_45_50_x1000;
-}
-
-uint8_t AP_IR_GetZcrDeadZone(uint16_t dead_zone[3])
-{
-    if (dead_zone != NULL) {
-        for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
-            dead_zone[ch] = s_ir.zcr_dead_zone[ch];
-        }
-    }
-    return s_ir.dead_zone_ready;
-}
-
-int AP_IR_StartZcrCalibration(void)
-{
-    if ((s_zcr_cal.state == AP_IR_ZCR_CAL_WARMUP) ||
-        (s_zcr_cal.state == AP_IR_ZCR_CAL_COLLECTING)) {
-        return -1;
-    }
-    /* 标定只允许从无火警状态启动，防止明显火焰数据污染本底。 */
-    if (s_ir.state != IR_STATE_IDLE) return -2;
-
-    memset(&s_zcr_cal, 0, sizeof(s_zcr_cal));
-    s_zcr_cal.state = AP_IR_ZCR_CAL_WARMUP;
-    s_zcr_cal.phase_start_ms = HAL_GetTick();
-    DBG("ZCR_CAL started: warmup=%lu ms windows=%u x %u samples",
-        (unsigned long)IR_ZCR_CAL_WARMUP_MS,
-        (unsigned int)IR_ZCR_CAL_WINDOW_COUNT,
-        (unsigned int)IR_ZCR_CAL_WINDOW_SAMPLES);
-    return 0;
-}
-
-void AP_IR_CancelZcrCalibration(void)
-{
-    /* 取消只清标定上下文，不改变当前生效死区和EEPROM。 */
-    memset(&s_zcr_cal, 0, sizeof(s_zcr_cal));
-    s_zcr_cal.state = AP_IR_ZCR_CAL_IDLE;
-}
-
-void AP_IR_GetZcrCalibrationStatus(AP_IR_ZcrCalStatus_t *status)
-{
-    if (status == NULL) return;
-
-    memset(status, 0, sizeof(*status));
-    status->state = s_zcr_cal.state;
-    status->windows_collected = s_zcr_cal.windows_collected;
-    status->windows_total = IR_ZCR_CAL_WINDOW_COUNT;
-    for (uint32_t ch = 0U; ch < IR_CH_NUM; ch++) {
-        status->dead_zone[ch] = s_ir.zcr_dead_zone[ch];
-    }
-
-    /* remaining_ms给出到全部窗口完成的估计时间，便于命令行观察进度。 */
-    const uint32_t window_ms = IR_ZCR_CAL_WINDOW_SAMPLES * 1000U /
-                               (uint32_t)IR_SAMPLE_RATE_HZ;
-    uint32_t now = HAL_GetTick();
-    if (s_zcr_cal.state == AP_IR_ZCR_CAL_WARMUP) {
-        uint32_t elapsed = now - s_zcr_cal.phase_start_ms;
-        uint32_t warmup_left = (elapsed < IR_ZCR_CAL_WARMUP_MS) ?
-                               (IR_ZCR_CAL_WARMUP_MS - elapsed) : 0U;
-        status->remaining_ms = warmup_left + IR_ZCR_CAL_WINDOW_COUNT * window_ms;
-    } else if (s_zcr_cal.state == AP_IR_ZCR_CAL_COLLECTING) {
-        uint32_t next_left = ((int32_t)(s_zcr_cal.next_window_ms - now) > 0) ?
-                             (s_zcr_cal.next_window_ms - now) : 0U;
-        uint32_t windows_after_next = IR_ZCR_CAL_WINDOW_COUNT -
-                                      s_zcr_cal.windows_collected - 1U;
-        status->remaining_ms = next_left + windows_after_next * window_ms;
-    }
 }
 
 /* ========================================================================== */
@@ -2045,15 +2157,12 @@ void AP_IR_TestPrint(uint32_t now)
         raw[ch] = AP_ADC_GetLatest(ch);
         history_push(ch, raw[ch]);
     }
-    /* 测试打印路径也可执行手动标定，但不会进入正式火焰状态机。 */
-    process_zcr_calibration(now);
-
     /* 测试功率沿用原50点窗口，保证与既有0.5秒测试数据可直接比较。 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
         if (s_ir.history[ch].count < IR_DC_POWER_WINDOW_SIZE) return;
     }
 
-    int32_t work[IR_HISTORY_SIZE];
+    int32_t work[IR_DC_POWER_WINDOW_SIZE];
     uint32_t pwr[IR_CH_NUM];
     /* 逐通道: 线性化 → DC偏置 → 去直流 → 均方值 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
@@ -2080,17 +2189,16 @@ void AP_IR_TestPrint(uint32_t now)
 
 void AP_IR_DebugProcess(uint32_t now)
 {
-    /* 调试行包含ZCR，因此等待200点；其中DC和Power仍按最近50点计算。 */
+    /* 调试行包含FFT，因此等待256点；其中DC和Power仍按最近50点计算。 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
-        if (s_ir.history[ch].count < IR_ZCR_WINDOW_SIZE) return;
+        if (s_ir.history[ch].count < IR_FFT_WINDOW_SIZE) return;
     }
 
-    int32_t work[IR_HISTORY_SIZE];
+    int32_t work[IR_DC_POWER_WINDOW_SIZE];
     int32_t dc_offset[IR_CH_NUM];
     uint32_t power[IR_CH_NUM];
-    float    zcr[IR_CH_NUM];
 
-    /* DC/Power保持50点测试口径，ZCR独立使用200点长窗口。 */
+    /* DC/Power保持50点测试口径，FFT独立使用256点窗口。 */
     for (uint32_t ch = 0; ch < IR_CH_NUM; ch++) {
         uint16_t n = history_raw_to_workbuf(&s_ir.history[ch], work,
                                             IR_DC_POWER_WINDOW_SIZE);
@@ -2100,24 +2208,42 @@ void AP_IR_DebugProcess(uint32_t now)
         history_to_workbuf(&s_ir.history[ch], work, IR_DC_POWER_WINDOW_SIZE);
         remove_dc(work, IR_DC_POWER_WINDOW_SIZE);
         power[ch] = calc_mean_square(work, IR_DC_POWER_WINDOW_SIZE);
-
-        history_to_workbuf(&s_ir.history[ch], work, IR_ZCR_WINDOW_SIZE);
-        remove_dc(work, IR_ZCR_WINDOW_SIZE);
-        zcr[ch] = calc_zcr(work, IR_ZCR_WINDOW_SIZE,
-                           IR_SAMPLE_RATE_HZ, s_ir.zcr_dead_zone[ch]);
     }
+    update_fft_features(&s_ir, now);
 
     /* 与正式算法一致：参考严格为0时按主通道能量决定比例饱和或归零。 */
     uint32_t r45_38 = calc_ratio_x1000(power[IR_CH_MAIN], power[IR_CH_REF_A]);
     uint32_t r45_50 = calc_ratio_x1000(power[IR_CH_MAIN], power[IR_CH_REF_B]);
+    bool ref_a_valid = reference_fft_valid(&s_ir, IR_CH_REF_A);
+    bool ref_b_valid = reference_fft_valid(&s_ir, IR_CH_REF_B);
+    uint32_t fft_ratio_38 = ref_a_valid
+                          ? calc_ratio_x1000(s_ir.feat[IR_CH_MAIN].band_magnitude_sum,
+                                             s_ir.feat[IR_CH_REF_A].band_magnitude_sum) : 0U;
+    uint32_t fft_ratio_50 = ref_b_valid
+                          ? calc_ratio_x1000(s_ir.feat[IR_CH_MAIN].band_magnitude_sum,
+                                             s_ir.feat[IR_CH_REF_B].band_magnitude_sum) : 0U;
 
-    /* 保持既有测试数据列不变；固定死区及手动标定进度通过ir命令查看。 */
-    BSP_UART_Printf("T%lu IRD DC=%ld,%ld,%ld P=%lu,%lu,%lu Z10=%u,%u,%u R1000=%lu,%lu\r\n",
+    /* X/XR先用于真实火焰和干扰源标定，未取得样本边界前不新增硬判据。 */
+    BSP_UART_Printf("T%lu IRD DC=%ld,%ld,%ld P=%lu,%lu,%lu F10=%u,%u,%u FB1000=%u,%u,%u FC1000=%u,%u,%u FP1000=%u,%u,%u X=%lu,%lu,%lu XR1000=%lu,%lu REFV=%u,%u R1000=%lu,%lu\r\n",
         (unsigned long)now,
         (long)dc_offset[0], (long)dc_offset[1], (long)dc_offset[2],
         (unsigned long)power[0], (unsigned long)power[1], (unsigned long)power[2],
-        (unsigned int)zcr_to_x10(zcr[0]),
-        (unsigned int)zcr_to_x10(zcr[1]),
-        (unsigned int)zcr_to_x10(zcr[2]),
+        (unsigned int)s_ir.feat[0].dominant_freq_x10,
+        (unsigned int)s_ir.feat[1].dominant_freq_x10,
+        (unsigned int)s_ir.feat[2].dominant_freq_x10,
+        (unsigned int)s_ir.feat[0].band_ratio_x1000,
+        (unsigned int)s_ir.feat[1].band_ratio_x1000,
+        (unsigned int)s_ir.feat[2].band_ratio_x1000,
+        (unsigned int)s_ir.feat[0].core_ratio_x1000,
+        (unsigned int)s_ir.feat[1].core_ratio_x1000,
+        (unsigned int)s_ir.feat[2].core_ratio_x1000,
+        (unsigned int)s_ir.feat[0].peak_support_x1000,
+        (unsigned int)s_ir.feat[1].peak_support_x1000,
+        (unsigned int)s_ir.feat[2].peak_support_x1000,
+        (unsigned long)s_ir.feat[0].band_magnitude_sum,
+        (unsigned long)s_ir.feat[1].band_magnitude_sum,
+        (unsigned long)s_ir.feat[2].band_magnitude_sum,
+        (unsigned long)fft_ratio_38, (unsigned long)fft_ratio_50,
+        (unsigned int)ref_a_valid, (unsigned int)ref_b_valid,
         (unsigned long)r45_38, (unsigned long)r45_50);
 }

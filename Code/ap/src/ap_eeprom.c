@@ -56,7 +56,7 @@ typedef struct {
 
 /*
  * v6只保存一个固定进场功率。保留旧布局用于一次性迁移，避免升级固件时
- * 丢失现场已经设置的灵敏度、光谱参数和手动标定ZCR死区。
+ * 丢失现场已经设置的灵敏度、光谱参数和旧ZCR兼容字段。
  */
 typedef struct {
     uint32_t magic;
@@ -195,6 +195,7 @@ static int ir_params_valid(const AP_EEPROM_IR_Param_t *p)
         p->freq_low_x10 > p->freq_high_x10 ||
         p->freq_high_x10 > PARAM_IR_FREQ_MAX_X10) return 0;
     if (p->cfm_min > p->cfm_max || p->cfm_max > PARAM_TIME_MAX_MS) return 0;
+    /* 该三个字仅用于继续接受旧v7数据，FFT检测链不使用其数值。 */
     for (uint32_t ch = 0; ch < 3U; ch++) {
         if (p->zcr_dead_zone[ch] < PARAM_IR_DEAD_ZONE_MIN ||
             p->zcr_dead_zone[ch] > PARAM_IR_DEAD_ZONE_MAX) return 0;

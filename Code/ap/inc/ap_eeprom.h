@@ -105,7 +105,7 @@ typedef struct {
     uint32_t    freq_high_x10;      /* 频率上限(×10)   固定  */
     uint32_t    cfm_min;            /* 确认时长(ms)    等级0  */
     uint32_t    cfm_max;            /* 确认时长(ms)    等级9  */
-    uint32_t    zcr_dead_zone[3];    /* 3.8/4.5/5.0通道固定死区 */
+    uint32_t    zcr_dead_zone[3];    /* v7兼容占位；FFT算法不再读取 */
     uint16_t    crc16;
     uint16_t    _pad;
 } AP_EEPROM_IR_Param_t;
@@ -156,9 +156,9 @@ typedef struct {
 #define AP_EEPROM_IR_DEFAULT_FREQ_HIGH 200U     /* 20Hz ×10 (固定) */
 #define AP_EEPROM_IR_DEFAULT_CFM_MIN   200U     /* 200ms */
 #define AP_EEPROM_IR_DEFAULT_CFM_MAX   3000U    /* 3000ms */
-#define AP_EEPROM_IR_DEFAULT_DZ_38     15U      /* 3.8um固定ZCR死区 */
-#define AP_EEPROM_IR_DEFAULT_DZ_45     15U      /* 4.5um固定ZCR死区 */
-#define AP_EEPROM_IR_DEFAULT_DZ_50     10U      /* 5.0um固定ZCR死区 */
+#define AP_EEPROM_IR_DEFAULT_DZ_38     15U      /* 保留旧v7 EEPROM布局的兼容值 */
+#define AP_EEPROM_IR_DEFAULT_DZ_45     15U      /* 保留旧v7 EEPROM布局的兼容值 */
+#define AP_EEPROM_IR_DEFAULT_DZ_50     10U      /* 保留旧v7 EEPROM布局的兼容值 */
 
 /* ========================================================================== */
 /*                        公有 API                                             */

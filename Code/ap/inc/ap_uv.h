@@ -59,6 +59,12 @@ void AP_UV_Process(uint32_t now);
 void AP_UV_Task(void);
 
 /**
+  * @brief  只清除底层捕获队列和上层脉冲历史，不修改当前报警状态。
+  * @note   修改脉宽过滤范围后调用，防止旧范围接收的脉冲参与新窗口判定。
+  */
+void AP_UV_ClearPulseHistory(void);
+
+/**
   * @brief  设置 3 项检测参数的 min/max 范围（即等级 0 和等级 9 的值）
   *         供初始化或命令行修改 min/max 后调用。
   *         设置后需调用 AP_UV_SetLevel 才能生效。
