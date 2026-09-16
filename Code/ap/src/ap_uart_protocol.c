@@ -47,6 +47,7 @@ typedef enum {
     RX_PARSE_FRAME,
 } RxParseState_t;
 
+/** @brief 最多两帧的响应事务；GET_CONFIG使用配置帧加F0，其余请求只使用F0。 */
 typedef struct {
     uint8_t  active;
     uint8_t  frame_count;
@@ -73,6 +74,7 @@ typedef struct {
     uint8_t  response_frame[AP_UART_RESPONSE_FRAME_COUNT_MAX][AP_UART_FRAME_MAX];
 } RequestCache_t;
 
+/** @brief 当前配置会话及请求序号基准；新握手或链路异常会整体清零。 */
 typedef struct {
     uint8_t  active;
     uint32_t nonce;
@@ -129,7 +131,10 @@ static uint16_t next_tx_sequence(void)
     return s_tx_sequence;
 }
 
-/** @brief 将一条逻辑消息编码为bot_wheel兼容线帧，CRC按小端写入。 */
+/**
+ * @brief  将一条逻辑消息编码为线帧，并分配非零发送序号。
+ * @return 完整帧长度；参数或Data长度非法时返回0。
+ */
 static uint16_t build_frame(uint8_t message_id, const uint8_t *data,
                             uint16_t data_len, uint8_t *frame)
 {
@@ -159,6 +164,7 @@ static uint16_t build_frame(uint8_t message_id, const uint8_t *data,
     return (uint16_t)(crc_offset + 2U);
 }
 
+/** @brief 开始新的响应事务，同时启动500ms发送进展计时。 */
 static void tx_bundle_begin(void)
 {
     memset(&s_tx, 0, sizeof(s_tx));
@@ -166,6 +172,7 @@ static void tx_bundle_begin(void)
     s_tx.last_progress_ms = HAL_GetTick();
 }
 
+/** @brief 按顺序向当前响应事务追加一帧，容量或组帧失败时返回0。 */
 static uint8_t tx_bundle_add(uint8_t message_id, const uint8_t *data,
                              uint16_t data_len)
 {
@@ -185,6 +192,7 @@ static uint8_t tx_bundle_add(uint8_t message_id, const uint8_t *data,
     return 1U;
 }
 
+/** @brief 生成固定6字节Data的F0结果帧，并在USART1记录业务结果。 */
 static void append_f0(uint16_t request_sequence, uint8_t request_message_id,
                       AP_UART_Result_t result)
 {
@@ -196,9 +204,19 @@ static void append_f0(uint16_t request_sequence, uint8_t request_message_id,
     data[4] = 0U; /* error_code按简化协议保留为0。 */
     data[5] = 0U;
     (void)tx_bundle_add(AP_MSG_COMMAND_RESPONSE, data, sizeof(data));
+
+    /*
+     * 配置请求频率很低，允许在主循环通过USART1输出最终处理结果。
+     * 该位置位于EEPROM写入、读回及运行参数更新之后，SUCCESS表示配置已真正生效；
+     * 日志不得走USART2，避免文本字节破坏树莓派二进制协议流。
+     */
+    BSP_UART_Printf("[PROTO] RESP REQ_SEQ=%u ID=0x%02X RESULT=%s\r\n",
+                    (unsigned int)request_sequence,
+                    (unsigned int)request_message_id,
+                    (result == AP_UART_RESULT_SUCCESS) ? "SUCCESS" : "FAILED");
 }
 
-/** @brief 缓存请求和当前应答，保证重复SET不会再次擦写EEPROM。 */
+/** @brief 缓存请求及全部响应，保证重复SET不再擦写EEPROM。 */
 static void cache_current_response(uint16_t sequence, uint8_t message_id,
                                    const uint8_t *data, uint8_t data_len)
 {
@@ -217,6 +235,7 @@ static void cache_current_response(uint16_t sequence, uint8_t message_id,
     }
 }
 
+/** @brief 比较请求序号、ID、长度和Data，判断是否为最近请求的原样重发。 */
 static uint8_t cached_request_matches(uint16_t sequence, uint8_t message_id,
                                       const uint8_t *data, uint8_t data_len)
 {
@@ -231,6 +250,7 @@ static uint8_t cached_request_matches(uint16_t sequence, uint8_t message_id,
     return (memcmp(s_cache.request_data, data, data_len) == 0) ? 1U : 0U;
 }
 
+/** @brief 原样重放缓存响应；保留旧响应帧序号，不重新执行请求。 */
 static void replay_cached_response(void)
 {
     memset(&s_tx, 0, sizeof(s_tx));
@@ -244,6 +264,7 @@ static void replay_cached_response(void)
     }
 }
 
+/** @brief 丢弃当前候选帧并回到SOF搜索状态。 */
 static void parser_reset(void)
 {
     s_rx_state = RX_PARSE_SOF0;
@@ -252,6 +273,7 @@ static void parser_reset(void)
     s_rx_start_ms = 0U;
 }
 
+/** @brief 结束配置会话，同时清除序号基准和最近请求缓存。 */
 static void session_reset(void)
 {
     memset(&s_session, 0, sizeof(s_session));
@@ -265,6 +287,7 @@ static uint8_t sequence_is_newer(uint16_t sequence, uint16_t previous)
     return (delta != 0U && delta < 0x8000U) ? 1U : 0U;
 }
 
+/** @brief 将已经持久化的UV配置同步到检测器和脉宽捕获驱动。 */
 static void apply_uv_config(const AP_EEPROM_UV_Param_t *p)
 {
     AP_UV_SetConfig(p->thr_min, p->thr_max, p->win_min, p->win_max,
@@ -274,9 +297,8 @@ static void apply_uv_config(const AP_EEPROM_UV_Param_t *p)
 }
 
 /**
- * @brief Abort an invalid transport exchange and require a new handshake.
- * @note  A partial frame cannot be resumed safely after DMA/UART failure because
- *        the peer cannot know how many bytes reached the wire.
+ * @brief 终止失去同步的收发事务并要求重新握手。
+ * @note  UART错误、DMA覆盖或发送超时后无法确认线上已有多少字节，残帧不可复用。
  */
 static void abort_transport(void)
 {
@@ -287,6 +309,7 @@ static void abort_transport(void)
     session_reset();
 }
 
+/** @brief 将已经持久化的IR配置同步到检测器当前运行参数。 */
 static void apply_ir_config(const AP_EEPROM_IR_Param_t *p)
 {
     AP_IR_SetConfig(p->power_min, p->power_max,
@@ -314,6 +337,10 @@ static uint8_t set_system_value(uint8_t message_id, uint32_t value)
     return 0U;
 }
 
+/**
+ * @brief 事务式修改一个UV字段：候选组校验、落盘读回后再更新运行参数。
+ * @return 1表示已生效或原值相同，0表示ID、参数或存储失败。
+ */
 static uint8_t set_uv_value(uint8_t message_id, uint32_t value)
 {
     AP_EEPROM_UV_Param_t candidate = *AP_EEPROM_UV_Get();
@@ -349,6 +376,10 @@ static uint8_t set_uv_value(uint8_t message_id, uint32_t value)
     return 1U;
 }
 
+/**
+ * @brief 事务式修改一个IR字段：候选组校验、落盘读回后再更新运行参数。
+ * @return 1表示已生效或原值相同，0表示ID、参数或存储失败。
+ */
 static uint8_t set_ir_value(uint8_t message_id, uint32_t value)
 {
     AP_EEPROM_IR_Param_t candidate = *AP_EEPROM_IR_Get();
@@ -378,6 +409,7 @@ static uint8_t set_ir_value(uint8_t message_id, uint32_t value)
     return 1U;
 }
 
+/** @brief 校验SET的4字节Data，并按MessageID分发到SYSTEM、UV或IR参数组。 */
 static uint8_t set_config_value(uint8_t message_id, const uint8_t *data,
                                 uint8_t data_len)
 {
@@ -441,6 +473,7 @@ static void build_config_snapshot(uint8_t *snapshot)
     (void)offset; /* 长度由编译期常量和上方固定字段表共同约束。 */
 }
 
+/** @brief 完成新请求：追加F0、保存去重响应，并推进会话序号基准。 */
 static void finish_request(uint16_t sequence, uint8_t message_id,
                            const uint8_t *data, uint8_t data_len,
                            AP_UART_Result_t result)
@@ -451,6 +484,7 @@ static void finish_request(uint16_t sequence, uint8_t message_id,
     s_session.latest_sequence_valid = 1U;
 }
 
+/** @brief 校验非零nonce并建立新会话；完全重复的握手只重放缓存响应。 */
 static void handle_handshake(uint16_t sequence, const uint8_t *data,
                              uint8_t data_len, uint32_t now_ms)
 {
@@ -479,6 +513,7 @@ static void handle_handshake(uint16_t sequence, const uint8_t *data,
                    AP_UART_RESULT_SUCCESS);
 }
 
+/** @brief 生成固定84字节配置快照，并按“0x81数据帧、F0”顺序应答。 */
 static void handle_get_config(uint16_t sequence, const uint8_t *data,
                               uint8_t data_len)
 {
@@ -503,6 +538,10 @@ static void handle_get_config(uint16_t sequence, const uint8_t *data,
                    AP_UART_RESULT_SUCCESS);
 }
 
+/**
+ * @brief 处理已通过基础帧校验的请求，执行建联、去重、新旧序号和业务分发。
+ * @note  F0为单向响应，收到后静默丢弃且不刷新会话。
+ */
 static void process_request(uint16_t sequence, uint8_t message_id,
                             const uint8_t *data, uint8_t data_len,
                             uint32_t now_ms)
@@ -517,6 +556,24 @@ static void process_request(uint16_t sequence, uint8_t message_id,
     if (message_id == AP_MSG_COMMAND_RESPONSE) {
         /* F0不是树莓派业务请求，只静默丢弃，不能用于延长配置会话。 */
         return;
+    }
+
+    /*
+     * 能进入本函数说明版本、长度、CRC和非零Sequence均已校验通过。
+     * SET和HANDSHAKE均为4字节小端值，直接打印解析值便于核对树莓派组包；
+     * GET_CONFIG等无Data请求只打印长度。业务是否执行成功由后续RESP日志给出。
+     */
+    if (data_len == 4U) {
+        BSP_UART_Printf("[PROTO] RX OK SEQ=%u ID=0x%02X LEN=%u VALUE=%lu\r\n",
+                        (unsigned int)sequence,
+                        (unsigned int)message_id,
+                        (unsigned int)data_len,
+                        (unsigned long)get_u32_le(data));
+    } else {
+        BSP_UART_Printf("[PROTO] RX OK SEQ=%u ID=0x%02X LEN=%u\r\n",
+                        (unsigned int)sequence,
+                        (unsigned int)message_id,
+                        (unsigned int)data_len);
     }
 
     if (message_id == AP_MSG_HANDSHAKE) {
@@ -560,6 +617,7 @@ static void process_request(uint16_t sequence, uint8_t message_id,
                    success ? AP_UART_RESULT_SUCCESS : AP_UART_RESULT_FAILED);
 }
 
+/** @brief 校验完整候选帧的CRC和Sequence，通过后交给请求处理器。 */
 static void validate_complete_frame(uint32_t now_ms)
 {
     uint8_t payload_len = s_rx_frame[3];
@@ -583,7 +641,10 @@ static void validate_complete_frame(uint32_t now_ms)
     process_request(sequence, message_id, &s_rx_frame[7], data_len, now_ms);
 }
 
-/** @return 1表示刚完成一条候选帧，本轮RX任务应停止继续取数。 */
+/**
+ * @brief 逐字节搜索SOF并收集候选帧，支持DMA拆包和粘包。
+ * @return 1表示候选帧已完成或已判非法，本轮RX任务应停止取数。
+ */
 static uint8_t parser_feed(uint8_t byte, uint32_t now_ms)
 {
     switch (s_rx_state) {
@@ -640,6 +701,7 @@ static uint8_t parser_feed(uint8_t byte, uint32_t now_ms)
     return 0U;
 }
 
+/** @brief 初始化解析、响应、会话、去重和诊断模式状态。 */
 void AP_UART_ProtocolInit(void)
 {
     parser_reset();
@@ -649,6 +711,7 @@ void AP_UART_ProtocolInit(void)
     s_diagnostic_mode = 0U;
 }
 
+/** @brief 有界消费USART2 DMA数据；严格停等期间不解析下一请求。 */
 void AP_UART_RxTask(void)
 {
     uint8_t byte;
@@ -659,7 +722,7 @@ void AP_UART_RxTask(void)
         return;
     }
 
-    /* Read both latched flags every round; short-circuiting would leave one stale. */
+    /* 两个故障标志均为读取后清除，必须每轮分别读取，不能使用短路表达式。 */
     transport_fault = (uint8_t)(BSP_UART_TxFaulted(BSP_UART_COM) ? 1U : 0U);
     transport_fault |= (uint8_t)(BSP_UART_RxOverflowed(BSP_UART_COM) ? 1U : 0U);
     if (transport_fault != 0U) {
@@ -668,7 +731,7 @@ void AP_UART_RxTask(void)
     }
 
     now_ms = HAL_GetTick();
-    /* Discard a stale partial frame before appending newly arrived bytes. */
+    /* 半帧超过100ms后先丢弃，再从新到达数据中搜索SOF。 */
     if (s_rx_state != RX_PARSE_SOF0 &&
         (uint32_t)(now_ms - s_rx_start_ms) >= AP_UART_FRAME_TIMEOUT_MS) {
         parser_reset();
@@ -689,6 +752,7 @@ void AP_UART_RxTask(void)
     }
 }
 
+/** @brief 非阻塞推进响应入队，并等待USART2 DMA物理发送完成。 */
 void AP_UART_TxTask(void)
 {
     uint16_t remaining;
@@ -730,6 +794,7 @@ void AP_UART_TxTask(void)
     }
 }
 
+/** @brief 处理半帧、响应发送和空闲会话三类超时。 */
 void AP_UART_CheckTimeout(void)
 {
     uint32_t now_ms = HAL_GetTick();
@@ -745,7 +810,7 @@ void AP_UART_CheckTimeout(void)
 
     if (s_tx.active != 0U &&
         (uint32_t)(now_ms - s_tx.last_progress_ms) >= AP_UART_TX_TIMEOUT_MS) {
-        /* A normal 128-byte response finishes far below this bounded timeout. */
+        /* 正常128字节帧远快于500ms；超时说明发送链路已失去进展。 */
         abort_transport();
         return;
     }
@@ -759,12 +824,14 @@ void AP_UART_CheckTimeout(void)
     }
 }
 
+/** @brief 判断解析器、响应事务和底层物理发送是否全部空闲。 */
 bool AP_UART_IsIdle(void)
 {
     return (s_rx_state == RX_PARSE_SOF0) && (s_tx.active == 0U) &&
            BSP_UART_IsTxComplete(BSP_UART_COM);
 }
 
+/** @brief 切换USART2原始诊断独占模式；切换边界会清除协议残帧和会话。 */
 void AP_UART_SetDiagnosticMode(bool enabled)
 {
     uint8_t next = enabled ? 1U : 0U;
@@ -781,6 +848,7 @@ void AP_UART_SetDiagnosticMode(bool enabled)
     s_diagnostic_mode = next;
 }
 
+/** @brief 返回USART2是否正由本地原始诊断命令独占。 */
 bool AP_UART_GetDiagnosticMode(void)
 {
     return (s_diagnostic_mode != 0U);

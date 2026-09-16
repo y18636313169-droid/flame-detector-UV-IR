@@ -77,7 +77,10 @@ uint16_t BSP_UART_PeekPacket(BSP_UART_Id_t id, void *out, uint16_t offset, uint1
 void     BSP_UART_Consume(BSP_UART_Id_t id, uint16_t len);
 
 /* ---- 缓冲管理 ----------------------------------------------------------- */
+/** @brief 丢弃当前所有RX数据，DMA继续接收。 */
 void     BSP_UART_ClearRxBuf(BSP_UART_Id_t id);
+
+/** @brief 中止TX DMA并丢弃当前所有待发数据。 */
 void     BSP_UART_ClearTxBuf(BSP_UART_Id_t id);
 
 /* ---- Printf ------------------------------------------------------------- */

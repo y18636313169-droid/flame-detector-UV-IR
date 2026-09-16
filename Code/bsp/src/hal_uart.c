@@ -91,9 +91,8 @@ static inline BSP_UART_Ctrl_t *get_ctrl(BSP_UART_Id_t id)
 }
 
 /**
- * @brief Return the monotonic RX DMA producer count.
- * @note  The TC callback counts complete DMA rounds. The last-total correction
- *        covers the short interval after NDTR reloads but before the TC ISR runs.
+ * @brief 返回RX循环DMA自启动以来的单调生产字节数。
+ * @note  TC回调累计完整圈数；NDTR已重装但TC中断尚未执行时由last_total补偿一次回绕。
  */
 static uint32_t rx_dma_produced(BSP_UART_Ctrl_t *ctrl)
 {
@@ -120,6 +119,7 @@ static uint32_t rx_dma_produced(BSP_UART_Ctrl_t *ctrl)
     return total;
 }
 
+/** @brief 计算RX可读字节数；DMA追上消费者时丢弃失去边界的数据并锁存故障。 */
 static uint16_t rx_data_avail(BSP_UART_Ctrl_t *ctrl)
 {
     uint32_t produced = rx_dma_produced(ctrl);
@@ -139,6 +139,7 @@ static inline uint8_t *rx_buf_at(BSP_UART_Ctrl_t *ctrl, uint16_t offset)
     return &ctrl->rx_buf[(ctrl->rx_rd_total + offset) & RX_MASK];
 }
 
+/** @brief 从TX读指针启动一段连续DMA，并锁存本次DMA拥有的准确长度。 */
 static void start_tx_dma(BSP_UART_Ctrl_t *ctrl)
 {
     uint16_t avail = (ctrl->tx_in - ctrl->tx_out) & TX_MASK;
@@ -288,6 +289,7 @@ bool BSP_UART_IsTxComplete(BSP_UART_Id_t id)
     return (!ctrl->tx_busy) && (ctrl->tx_in == ctrl->tx_out);
 }
 
+/** @brief 读取并清除TX故障锁存；协议层据此废弃无法确认完整性的响应。 */
 bool BSP_UART_TxFaulted(BSP_UART_Id_t id)
 {
     bool fault;
@@ -330,6 +332,7 @@ uint16_t BSP_UART_GetRxDataLen(BSP_UART_Id_t id)
     return rx_data_avail(get_ctrl(id));
 }
 
+/** @brief 读取并清除RX覆盖/错误锁存，并在主循环重试失败的DMA恢复。 */
 bool BSP_UART_RxOverflowed(BSP_UART_Id_t id)
 {
     bool overflow;
@@ -414,6 +417,7 @@ void BSP_UART_Consume(BSP_UART_Id_t id, uint16_t len)
     __set_PRIMASK(primask);
 }
 
+/** @brief 仅追平RX消费者，不改写仍由DMA持续维护的接收内存。 */
 void BSP_UART_ClearRxBuf(BSP_UART_Id_t id)
 {
     if (!is_valid_id(id) || !get_ctrl(id)->initialized) return;
@@ -425,6 +429,7 @@ void BSP_UART_ClearRxBuf(BSP_UART_Id_t id)
     __set_PRIMASK(primask);
 }
 
+/** @brief 中止当前TX DMA并丢弃全部待发字节。 */
 void BSP_UART_ClearTxBuf(BSP_UART_Id_t id)
 {
     if (!is_valid_id(id) || !get_ctrl(id)->initialized) return;
@@ -469,6 +474,7 @@ int BSP_UART_Printf(const char *fmt, ...)
 /*                     HAL 回调覆盖                                            */
 /* ========================================================================== */
 
+/** @brief TX DMA完成后仅推进该次DMA长度，随后继续发送环形缓冲剩余数据。 */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
     uint32_t primask = __get_PRIMASK();
@@ -490,6 +496,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     if (more) start_tx_dma(ctrl);
 }
 
+/** @brief RX循环DMA每完成一圈累计一次，用于构造单调生产计数。 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     BSP_UART_Ctrl_t *ctrl = find_ctrl_by_handle(huart);
@@ -498,6 +505,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
+/** @brief UART错误使当前收发边界失效；锁存故障并重新启动RX DMA。 */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     BSP_UART_Ctrl_t *ctrl = find_ctrl_by_handle(huart);

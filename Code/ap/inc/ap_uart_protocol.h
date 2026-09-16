@@ -85,7 +85,7 @@ void AP_UART_RxTask(void);
 /** @brief 主循环调用：非阻塞地把当前响应帧推进USART2 TX DMA队列。 */
 void AP_UART_TxTask(void);
 
-/** @brief 主循环调用：处理100ms半帧超时和10s会话超时。 */
+/** @brief 主循环调用：处理100ms半帧、500ms发送和10s会话超时。 */
 void AP_UART_CheckTimeout(void);
 
 /** @brief 查询协议解析、响应发送及USART2物理发送是否均为空闲。 */
@@ -97,6 +97,8 @@ bool AP_UART_IsIdle(void);
  *         USART2只允许测试命令直接访问。
  */
 void AP_UART_SetDiagnosticMode(bool enabled);
+
+/** @brief 查询USART2是否处于原始诊断独占模式。 */
 bool AP_UART_GetDiagnosticMode(void);
 
 #ifdef __cplusplus
