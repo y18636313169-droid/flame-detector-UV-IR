@@ -79,6 +79,13 @@ int  BSP_EEPROM_Verify(uint32_t addr, const void *buf, uint32_t size);
 /** @brief  默认值回调函数类型（参数无效时调用） */
 typedef void (*BSP_EEPROM_DefaultsFn)(void *buf);
 
+typedef enum {
+    BSP_EEPROM_LOAD_VALID = 0,
+    BSP_EEPROM_LOAD_MAGIC_DEFAULTED = 1,
+    BSP_EEPROM_LOAD_CRC_DEFAULTED = 2,
+    BSP_EEPROM_LOAD_WRITE_ERROR = -1,
+} BSP_EEPROM_LoadResult_t;
+
 /**
   * @brief  从扇区读取 + 魔数 + CRC 校验，失败则写默认值
   * @param  addr       EEPROM 地址
@@ -87,8 +94,10 @@ typedef void (*BSP_EEPROM_DefaultsFn)(void *buf);
   * @param  magic      期望魔数
   * @param  def_fn     写入默认值的回调
   * @param  crc_off    crc16 字段在结构体中的字节偏移
-  * @retval 0: 成功（有效数据或已写入默认值）
-  * @retval -1: 写入默认值失败
+  * @retval BSP_EEPROM_LOAD_VALID: 原数据有效
+  * @retval BSP_EEPROM_LOAD_MAGIC_DEFAULTED: 魔数不符，默认值已写入
+  * @retval BSP_EEPROM_LOAD_CRC_DEFAULTED: CRC不符，默认值已写入
+  * @retval BSP_EEPROM_LOAD_WRITE_ERROR: 默认值写入或读回失败
   */
 int  BSP_EEPROM_LoadSector(uint32_t addr, void *buf, uint32_t size,
                             uint32_t magic, BSP_EEPROM_DefaultsFn def_fn,

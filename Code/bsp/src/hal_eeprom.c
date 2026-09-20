@@ -72,6 +72,7 @@ int BSP_EEPROM_LoadSector(uint32_t addr, void *buf, uint32_t size,
                            uint16_t crc_off)
 {
     uint8_t valid = 0;
+    BSP_EEPROM_LoadResult_t invalid_reason = BSP_EEPROM_LOAD_MAGIC_DEFAULTED;
 
     BSP_EEPROM_Read(addr, buf, size);
 
@@ -84,6 +85,8 @@ int BSP_EEPROM_LoadSector(uint32_t addr, void *buf, uint32_t size,
 
         if (saved_crc == calc_crc) {
             valid = 1;
+        } else {
+            invalid_reason = BSP_EEPROM_LOAD_CRC_DEFAULTED;
         }
     }
 
@@ -96,7 +99,11 @@ int BSP_EEPROM_LoadSector(uint32_t addr, void *buf, uint32_t size,
     *(uint16_t *)((uint8_t *)buf + crc_off) = 0;
     *(uint16_t *)((uint8_t *)buf + crc_off) = CRC16_CCITT((const uint8_t *)buf, size);
 
-    return BSP_EEPROM_Write(addr, buf, size);
+    if (BSP_EEPROM_Write(addr, buf, size) != 0 ||
+        BSP_EEPROM_Verify(addr, buf, size) != 0) {
+        return BSP_EEPROM_LOAD_WRITE_ERROR;
+    }
+    return invalid_reason;
 }
 
 int BSP_EEPROM_SaveSector(uint32_t addr, void *buf, uint32_t size,

@@ -65,6 +65,12 @@ int APP_SetTestMode(uint8_t en);
 uint8_t APP_GetTestMode(void);
 int APP_SetIrProfileEnabled(uint8_t en);
 uint8_t APP_GetIrProfileEnabled(void);
+/** @brief 获取最终整机火警锁存状态，不等同于单个IR/UV内部FIRE状态。 */
+uint8_t APP_GetAlarmActive(void);
+/** @brief 无整机火警时恢复所有现有持久化配置，成功返回0。 */
+int APP_FactoryReset(void);
+/** @brief 应用已校验的SYSTEM参数，不重复写EEPROM且不清除锁存火警。 */
+void APP_ApplySystemConfig(void);
 
 /* USER CODE END EFP */
 

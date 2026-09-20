@@ -45,6 +45,21 @@ void BSP_ADC_StopDMA(void);
   */
 int  BSP_ADC_ReadValue(uint32_t ch, uint16_t *raw);
 
+/** @brief ADC DMA完整扫描完成回调，仅递增采集进度计数。 */
+void BSP_ADC_ConvCpltHandler(ADC_HandleTypeDef *hadc_handle);
+
+/** @brief ADC/HAL错误回调，仅递增错误事件计数。 */
+void BSP_ADC_ErrorHandler(ADC_HandleTypeDef *hadc_handle);
+
+/** @brief 获取DMA已完成的三通道扫描次数，供主循环判断采集是否停止。 */
+uint32_t BSP_ADC_GetUpdateCount(void);
+
+/** @brief 获取ADC/HAL累计错误次数，计数不清零以避免ISR与主循环竞争。 */
+uint32_t BSP_ADC_GetErrorCount(void);
+
+/** @brief 查询ADC DMA是否已经由BSP成功启动。 */
+uint8_t BSP_ADC_IsRunning(void);
+
 #ifdef __cplusplus
 }
 #endif

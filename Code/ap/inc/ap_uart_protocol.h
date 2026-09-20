@@ -7,9 +7,10 @@
   *          AA 55 | Version | PayloadLen | SequenceLE | MessageID |
   *          Data | CRC16/CCITT-FALSE LE
   *
-  *          本板是配置从机，只响应树莓派请求，不维持心跳、不主动上报。
-  *          COMMAND_RESPONSE(0xF0)固定为6字节；0x81以空Data请求读取配置，
-  *          从机使用同一MessageID返回固定84字节配置快照。
+  *          本板是协议从机，只响应树莓派请求，不主动发送串口状态帧。
+  *          树莓派每30秒查询运行状态；ALARM/BUG电平变化后分别查询详情。
+  *          COMMAND_RESPONSE(0xF0)固定为6字节，各只读查询先返回数据帧，
+  *          再使用F0结束本次严格停等事务。
   ******************************************************************************
   */
 #ifndef __AP_UART_PROTOCOL_H__
@@ -38,14 +39,34 @@ extern "C" {
 #define AP_UART_RX_BUDGET_PER_TASK       (32U)
 #define AP_UART_CONFIG_SCHEMA_VERSION    (1U)
 #define AP_UART_CONFIG_FIELD_COUNT       (20U)
+#define AP_UART_STATUS_SCHEMA_VERSION    (1U)
+#define AP_UART_DEVICE_INFO_SCHEMA_VERSION (1U)
+
+/* 固件版本线格式：major.minor.patch.build，各段占8位。 */
+#define AP_FW_VERSION_MAJOR              (1U)
+#define AP_FW_VERSION_MINOR              (1U)
+#define AP_FW_VERSION_PATCH              (0U)
+#define AP_FW_VERSION_BUILD              (0U)
+#define AP_FW_VERSION_U32 \
+    ((AP_FW_VERSION_MAJOR << 24) | (AP_FW_VERSION_MINOR << 16) | \
+     (AP_FW_VERSION_PATCH << 8) | AP_FW_VERSION_BUILD)
 
 /* 树莓派请求、板端数据响应及统一结果应答的MessageID。 */
 typedef enum {
     AP_MSG_HANDSHAKE                  = 0x80,
     AP_MSG_GET_CONFIG                = 0x81,
+    AP_MSG_GET_STATUS                = 0x82,
+    AP_MSG_STATUS_DATA               = 0x83,
+    AP_MSG_GET_ALARM_DETAIL          = 0x84,
+    AP_MSG_ALARM_DETAIL              = 0x85,
+    AP_MSG_GET_FAULT_DETAIL          = 0x86,
+    AP_MSG_FAULT_DETAIL              = 0x87,
+    AP_MSG_GET_DEVICE_INFO           = 0x88,
+    AP_MSG_DEVICE_INFO               = 0x89,
 
     AP_MSG_SET_SHOW_MODE             = 0x90,
     AP_MSG_SET_IR_PROFILE_ENABLED    = 0x91,
+    AP_MSG_FACTORY_RESET             = 0x92,
 
     AP_MSG_SET_UV_SENSITIVITY        = 0xA0,
     AP_MSG_SET_UV_THR_MIN            = 0xA1,

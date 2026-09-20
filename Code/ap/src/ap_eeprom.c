@@ -6,6 +6,7 @@
   */
 
 #include "ap_eeprom.h"
+#include "ap_fault.h"
 #include "crc16.h"
 #include <string.h>
 
@@ -88,6 +89,47 @@ typedef char SystemLayoutMustFitOneSector[
      ((sizeof(AP_EEPROM_System_Param_t) % sizeof(uint32_t)) == 0U)) ? 1 : -1];
 typedef char SystemV1LayoutMustRemain20Bytes[
     (sizeof(AP_EEPROM_System_V1_Param_t) == 20U) ? 1 : -1];
+typedef char EepromFaultGroupLayoutMustMatch[
+    ((AP_EEPROM_GROUP_SYSTEM == AP_CONFIG_GROUP_SYSTEM) &&
+     (AP_EEPROM_GROUP_ADC == AP_CONFIG_GROUP_ADC) &&
+     (AP_EEPROM_GROUP_UV == AP_CONFIG_GROUP_UV) &&
+     (AP_EEPROM_GROUP_IR == AP_CONFIG_GROUP_IR)) ? 1 : -1];
+
+/** @brief 记录加载默认值的原因，避免参数自动恢复后掩盖原始EEPROM故障。 */
+static void record_load_result(uint16_t group, int load_result)
+{
+    if (load_result == BSP_EEPROM_LOAD_VALID) {
+        return;
+    }
+    if (load_result == BSP_EEPROM_LOAD_CRC_DEFAULTED) {
+        AP_Fault_Set(AP_FAULT_EEPROM_CRC_ERROR);
+    } else if (load_result == BSP_EEPROM_LOAD_MAGIC_DEFAULTED) {
+        AP_Fault_Set(AP_FAULT_EEPROM_VERSION_ERROR);
+    } else {
+        AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+    }
+    AP_Fault_SetConfigGroups(group);
+}
+
+/** @brief 区分结构版本错误与参数范围错误，并标记对应待重配组。 */
+static void record_semantic_error(uint16_t group, uint8_t version_error)
+{
+    AP_Fault_Set(version_error ? AP_FAULT_EEPROM_VERSION_ERROR
+                               : AP_FAULT_EEPROM_RANGE_ERROR);
+    AP_Fault_SetConfigGroups(group);
+}
+
+/** @brief 统一收口保存结果；仅在写入和读回均成功后清除参数组故障。 */
+static int finish_storage_operation(uint16_t group, int result)
+{
+    if (result == 0) {
+        AP_Fault_ClearConfigGroups(group);
+        return AP_EEPROM_OK;
+    }
+    AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+    AP_Fault_SetConfigGroups(group);
+    return AP_EEPROM_ERROR_STORAGE;
+}
 
 /* ========================================================================== */
 /*                         默认值回调                                          */
@@ -310,53 +352,87 @@ static int ir_try_migrate_v6(void)
 int AP_EEPROM_Init(void)
 {
     int ret = 0;
+    int load_result;
 
-    if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_ADC, &s_adc, sizeof(s_adc),
-                               EEPROM_ADC_MAGIC, adc_defaults,
-                               CRC_OFF(AP_EEPROM_ADC_Param_t, crc16)) != 0) {
+    load_result = BSP_EEPROM_LoadSector(
+        EEPROM_SECTOR_ADC, &s_adc, sizeof(s_adc), EEPROM_ADC_MAGIC,
+        adc_defaults, CRC_OFF(AP_EEPROM_ADC_Param_t, crc16));
+    record_load_result(AP_EEPROM_GROUP_ADC, load_result);
+    if (load_result == BSP_EEPROM_LOAD_WRITE_ERROR) {
         ret = -1;
     }
     /* CRC正确但语义非法时同样恢复默认值，避免合法CRC掩盖错误配置。 */
     if (!adc_params_valid(&s_adc)) {
+        uint8_t version_error =
+            (s_adc.version != 1U || s_adc.length != sizeof(s_adc)) ? 1U : 0U;
+        record_semantic_error(AP_EEPROM_GROUP_ADC, version_error);
         adc_defaults(&s_adc);
-        if (BSP_EEPROM_SaveSector(EEPROM_SECTOR_ADC, &s_adc, sizeof(s_adc),
-                                  CRC_OFF(AP_EEPROM_ADC_Param_t, crc16)) != 0) ret = -1;
+        if (BSP_EEPROM_SaveSector(
+                EEPROM_SECTOR_ADC, &s_adc, sizeof(s_adc),
+                CRC_OFF(AP_EEPROM_ADC_Param_t, crc16)) != 0) {
+            AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+            ret = -1;
+        }
     }
 
-    if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_UV, &s_uv, sizeof(s_uv),
-                               EEPROM_UV_MAGIC, uv_defaults,
-                               CRC_OFF(AP_EEPROM_UV_Param_t, crc16)) != 0) {
+    load_result = BSP_EEPROM_LoadSector(
+        EEPROM_SECTOR_UV, &s_uv, sizeof(s_uv), EEPROM_UV_MAGIC,
+        uv_defaults, CRC_OFF(AP_EEPROM_UV_Param_t, crc16));
+    record_load_result(AP_EEPROM_GROUP_UV, load_result);
+    if (load_result == BSP_EEPROM_LOAD_WRITE_ERROR) {
         ret = -1;
     }
     /* v3参数必须同时通过结构版本和业务范围校验。 */
     if (!uv_params_valid(&s_uv)) {
+        uint8_t version_error =
+            (s_uv.version != 3U || s_uv.length != sizeof(s_uv)) ? 1U : 0U;
+        record_semantic_error(AP_EEPROM_GROUP_UV, version_error);
         uv_defaults(&s_uv);
-        if (BSP_EEPROM_SaveSector(EEPROM_SECTOR_UV, &s_uv, sizeof(s_uv),
-                                  CRC_OFF(AP_EEPROM_UV_Param_t, crc16)) != 0) ret = -1;
+        if (BSP_EEPROM_SaveSector(
+                EEPROM_SECTOR_UV, &s_uv, sizeof(s_uv),
+                CRC_OFF(AP_EEPROM_UV_Param_t, crc16)) != 0) {
+            AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+            ret = -1;
+        }
     }
     /* 仅迁移历史默认上限27/28到实测进入阈值24，保留其余现场标定参数。 */
     if ((s_uv.thr_max == PARAM_UV_LEGACY_THR_MAX_V1) ||
         (s_uv.thr_max == PARAM_UV_LEGACY_THR_MAX_V2)) {
         s_uv.thr_max = AP_EEPROM_UV_DEFAULT_THR_MAX;
         if (BSP_EEPROM_SaveSector(EEPROM_SECTOR_UV, &s_uv, sizeof(s_uv),
-                                  CRC_OFF(AP_EEPROM_UV_Param_t, crc16)) != 0) ret = -1;
+                                  CRC_OFF(AP_EEPROM_UV_Param_t, crc16)) != 0) {
+            AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+            AP_Fault_SetConfigGroups(AP_EEPROM_GROUP_UV);
+            ret = -1;
+        }
     }
 
     int ir_migration = ir_try_migrate_v6();
     if (ir_migration < 0) {
         /* RAM中仍保留完整v7默认值；EEPROM写失败由返回值上报。 */
+        AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+        AP_Fault_SetConfigGroups(AP_EEPROM_GROUP_IR);
         ret = -1;
     } else if (ir_migration == 0) {
-        if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
-                                  EEPROM_IR_MAGIC, ir_defaults,
-                                  IR_CRC_OFFSET) != 0) {
+        load_result = BSP_EEPROM_LoadSector(
+            EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir), EEPROM_IR_MAGIC,
+            ir_defaults, IR_CRC_OFFSET);
+        record_load_result(AP_EEPROM_GROUP_IR, load_result);
+        if (load_result == BSP_EEPROM_LOAD_WRITE_ERROR) {
             ret = -1;
         }
         /* 非法v7内容由参数校验链恢复为v7默认值。 */
         if (!ir_params_valid(&s_ir)) {
+            uint8_t version_error =
+                (s_ir.version != EEPROM_IR_VERSION ||
+                 s_ir.length != sizeof(s_ir)) ? 1U : 0U;
+            record_semantic_error(AP_EEPROM_GROUP_IR, version_error);
             ir_defaults(&s_ir);
             if (BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
-                                      IR_CRC_OFFSET) != 0) ret = -1;
+                                      IR_CRC_OFFSET) != 0) {
+                AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+                ret = -1;
+            }
         }
     }
 
@@ -366,19 +442,30 @@ int AP_EEPROM_Init(void)
      */
     int system_migration = system_try_migrate_v1();
     if (system_migration < 0) {
+        AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+        AP_Fault_SetConfigGroups(AP_EEPROM_GROUP_SYSTEM);
         ret = -1;
     } else if (system_migration == 0) {
-        if (BSP_EEPROM_LoadSector(EEPROM_SECTOR_SYSTEM, &s_system,
-                                  sizeof(s_system), EEPROM_SYSTEM_MAGIC,
-                                  system_defaults,
-                                  CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) {
+        load_result = BSP_EEPROM_LoadSector(
+            EEPROM_SECTOR_SYSTEM, &s_system, sizeof(s_system),
+            EEPROM_SYSTEM_MAGIC, system_defaults,
+            CRC_OFF(AP_EEPROM_System_Param_t, crc16));
+        record_load_result(AP_EEPROM_GROUP_SYSTEM, load_result);
+        if (load_result == BSP_EEPROM_LOAD_WRITE_ERROR) {
             ret = -1;
         }
         if (!system_params_valid(&s_system)) {
+            uint8_t version_error =
+                (s_system.version != EEPROM_SYSTEM_VERSION ||
+                 s_system.length != sizeof(s_system)) ? 1U : 0U;
+            record_semantic_error(AP_EEPROM_GROUP_SYSTEM, version_error);
             system_defaults(&s_system);
             if (BSP_EEPROM_SaveSector(
                     EEPROM_SECTOR_SYSTEM, &s_system, sizeof(s_system),
-                    CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) ret = -1;
+                    CRC_OFF(AP_EEPROM_System_Param_t, crc16)) != 0) {
+                AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+                ret = -1;
+            }
         }
     }
 
@@ -394,24 +481,32 @@ const AP_EEPROM_ADC_Param_t *AP_EEPROM_ADC_Get(void)
 
 int AP_EEPROM_ADC_Save(const AP_EEPROM_ADC_Param_t *p)
 {
-    if (p == NULL) return -1;
+    if (p == NULL) return AP_EEPROM_ERROR_INVALID;
     /* 候选值先校验并写入成功后再提交到RAM，保存失败不污染运行副本。 */
     AP_EEPROM_ADC_Param_t candidate = *p;
     candidate.magic = EEPROM_ADC_MAGIC;
     candidate.version = 1U;
     candidate.length = sizeof(candidate);
-    if (!adc_params_valid(&candidate)) return -1;
+    if (!adc_params_valid(&candidate)) return AP_EEPROM_ERROR_INVALID;
     int ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_ADC, &candidate, sizeof(candidate),
                                     CRC_OFF(AP_EEPROM_ADC_Param_t, crc16));
-    if (ret == 0) s_adc = candidate;
-    return ret;
+    if (ret == 0) {
+        s_adc = candidate;
+    }
+    return finish_storage_operation(AP_EEPROM_GROUP_ADC, ret);
 }
 
 int AP_EEPROM_ADC_Reset(void)
 {
-    adc_defaults(&s_adc);
-    return BSP_EEPROM_SaveSector(EEPROM_SECTOR_ADC, &s_adc, sizeof(s_adc),
-                                  CRC_OFF(AP_EEPROM_ADC_Param_t, crc16));
+    AP_EEPROM_ADC_Param_t candidate;
+    int ret;
+
+    adc_defaults(&candidate);
+    ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_ADC, &candidate,
+                                sizeof(candidate),
+                                CRC_OFF(AP_EEPROM_ADC_Param_t, crc16));
+    if (ret == 0) s_adc = candidate;
+    return finish_storage_operation(AP_EEPROM_GROUP_ADC, ret);
 }
 
 /* ---- UV ---- */
@@ -423,24 +518,30 @@ const AP_EEPROM_UV_Param_t *AP_EEPROM_UV_Get(void)
 
 int AP_EEPROM_UV_Save(const AP_EEPROM_UV_Param_t *p)
 {
-    if (p == NULL) return -1;
+    if (p == NULL) return AP_EEPROM_ERROR_INVALID;
     /* 使用事务式候选副本，非法参数和Flash失败都保留原配置。 */
     AP_EEPROM_UV_Param_t candidate = *p;
     candidate.magic = EEPROM_UV_MAGIC;
     candidate.version = 3U;
     candidate.length = sizeof(candidate);
-    if (!uv_params_valid(&candidate)) return -1;
+    if (!uv_params_valid(&candidate)) return AP_EEPROM_ERROR_INVALID;
     int ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_UV, &candidate, sizeof(candidate),
                                     CRC_OFF(AP_EEPROM_UV_Param_t, crc16));
     if (ret == 0) s_uv = candidate;
-    return ret;
+    return finish_storage_operation(AP_EEPROM_GROUP_UV, ret);
 }
 
 int AP_EEPROM_UV_Reset(void)
 {
-    uv_defaults(&s_uv);
-    return BSP_EEPROM_SaveSector(EEPROM_SECTOR_UV, &s_uv, sizeof(s_uv),
-                                  CRC_OFF(AP_EEPROM_UV_Param_t, crc16));
+    AP_EEPROM_UV_Param_t candidate;
+    int ret;
+
+    uv_defaults(&candidate);
+    ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_UV, &candidate,
+                                sizeof(candidate),
+                                CRC_OFF(AP_EEPROM_UV_Param_t, crc16));
+    if (ret == 0) s_uv = candidate;
+    return finish_storage_operation(AP_EEPROM_GROUP_UV, ret);
 }
 
 /* ---- IR ---- */
@@ -452,24 +553,29 @@ const AP_EEPROM_IR_Param_t *AP_EEPROM_IR_Get(void)
 
 int AP_EEPROM_IR_Save(const AP_EEPROM_IR_Param_t *p)
 {
-    if (p == NULL) return -1;
+    if (p == NULL) return AP_EEPROM_ERROR_INVALID;
     /* 使用事务式候选副本，功率范围/固定判据在落盘前统一校验。 */
     AP_EEPROM_IR_Param_t candidate = *p;
     candidate.magic = EEPROM_IR_MAGIC;
     candidate.version = EEPROM_IR_VERSION;
     candidate.length = sizeof(candidate);
-    if (!ir_params_valid(&candidate)) return -1;
+    if (!ir_params_valid(&candidate)) return AP_EEPROM_ERROR_INVALID;
     int ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &candidate, sizeof(candidate),
                                     IR_CRC_OFFSET);
     if (ret == 0) s_ir = candidate;
-    return ret;
+    return finish_storage_operation(AP_EEPROM_GROUP_IR, ret);
 }
 
 int AP_EEPROM_IR_Reset(void)
 {
-    ir_defaults(&s_ir);
-    return BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &s_ir, sizeof(s_ir),
-                                  IR_CRC_OFFSET);
+    AP_EEPROM_IR_Param_t candidate;
+    int ret;
+
+    ir_defaults(&candidate);
+    ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_IR, &candidate,
+                                sizeof(candidate), IR_CRC_OFFSET);
+    if (ret == 0) s_ir = candidate;
+    return finish_storage_operation(AP_EEPROM_GROUP_IR, ret);
 }
 
 /* ---- System ---- */
@@ -481,7 +587,7 @@ const AP_EEPROM_System_Param_t *AP_EEPROM_System_Get(void)
 
 int AP_EEPROM_System_Save(const AP_EEPROM_System_Param_t *p)
 {
-    if (p == NULL) return -1;
+    if (p == NULL) return AP_EEPROM_ERROR_INVALID;
 
     /*
      * 先校验并写入候选副本，Flash写入成功后才提交RAM配置；
@@ -491,19 +597,37 @@ int AP_EEPROM_System_Save(const AP_EEPROM_System_Param_t *p)
     candidate.magic = EEPROM_SYSTEM_MAGIC;
     candidate.version = EEPROM_SYSTEM_VERSION;
     candidate.length = sizeof(candidate);
-    if (!system_params_valid(&candidate)) return -1;
+    if (!system_params_valid(&candidate)) return AP_EEPROM_ERROR_INVALID;
 
     int ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &candidate,
                                     sizeof(candidate),
                                     CRC_OFF(AP_EEPROM_System_Param_t, crc16));
     if (ret == 0) s_system = candidate;
-    return ret;
+    return finish_storage_operation(AP_EEPROM_GROUP_SYSTEM, ret);
 }
 
 int AP_EEPROM_System_Reset(void)
 {
-    system_defaults(&s_system);
-    return BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &s_system,
-                                 sizeof(s_system),
-                                 CRC_OFF(AP_EEPROM_System_Param_t, crc16));
+    AP_EEPROM_System_Param_t candidate;
+    int ret;
+
+    system_defaults(&candidate);
+    ret = BSP_EEPROM_SaveSector(EEPROM_SECTOR_SYSTEM, &candidate,
+                                sizeof(candidate),
+                                CRC_OFF(AP_EEPROM_System_Param_t, crc16));
+    if (ret == 0) s_system = candidate;
+    return finish_storage_operation(AP_EEPROM_GROUP_SYSTEM, ret);
+}
+
+uint16_t AP_EEPROM_ResetAll(void)
+{
+    uint16_t failed = 0U;
+
+    AP_Fault_SetDefaultsRecoveryActive(1U);
+    if (AP_EEPROM_System_Reset() != AP_EEPROM_OK) failed |= AP_EEPROM_GROUP_SYSTEM;
+    if (AP_EEPROM_ADC_Reset() != AP_EEPROM_OK) failed |= AP_EEPROM_GROUP_ADC;
+    if (AP_EEPROM_UV_Reset() != AP_EEPROM_OK) failed |= AP_EEPROM_GROUP_UV;
+    if (AP_EEPROM_IR_Reset() != AP_EEPROM_OK) failed |= AP_EEPROM_GROUP_IR;
+    AP_Fault_SetDefaultsRecoveryActive(0U);
+    return failed;
 }

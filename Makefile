@@ -77,6 +77,7 @@ Code/bsp/src/hal_eeprom.c \
 Code/bsp/src/ring_buffer.c \
 Code/ap/src/ap_adc.c \
 Code/ap/src/ap_eeprom.c \
+Code/ap/src/ap_fault.c \
 Code/ap/src/ap_ir.c \
 Code/ap/src/ap_uart_protocol.c \
 Code/ap/src/ap_uv.c \

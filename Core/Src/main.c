@@ -36,6 +36,7 @@
 
 #include "ap_adc.h"
 #include "ap_eeprom.h"
+#include "ap_fault.h"
 #include "ap_ir.h"
 #include "ap_uart_protocol.h"
 #include "ap_uv.h"
@@ -67,10 +68,9 @@ static uint8_t           ir_print_enabled;      /* IR ADC 打印开关 */
 static uint8_t           uv_print_enabled;      /* UV 脉冲打印开关 */
 static uint8_t           show_mode_enabled;     /* 1: 演示模式仅用UV报警，由EEPROM恢复 */
 static uint8_t           test_mode_enabled;     /* 1: 运行时测试模式，不执行报警算法 */
-static uint8_t           alarm_output_active;   /* 最终ALM输出沿状态，模式切换时同步清零 */
-static uint8_t           adc_fault_output_active; /* BUG输出沿状态，仅由ADC轨到轨故障驱动 */
+static uint8_t           alarm_output_active;   /* 最终ALM锁存状态，仅RECOVER/复位清除 */
 static volatile uint8_t  recover_irq_pending;   /* EXTI只锁存事件，主循环执行完整恢复 */
-static uint8_t           recover_low_latched;   /* Continuous low level triggers only once */
+static uint8_t           recover_low_latched;   /* 持续低电平只允许触发一次恢复 */
 
 /* USER CODE END PV */
 
@@ -92,16 +92,15 @@ static void test_print_data(void)
 }
 
 /**
-  * @brief  Consume an active-low RECOVER edge and clear all alarm states once.
-  * @note   EXTI latches even a pulse that has ended before the main loop runs.
-  *         A continuous low level triggers only once; it must return high
-  *         before another recovery is accepted. Algorithm and history reset
-  *         deliberately remain outside interrupt context.
+  * @brief  消费一次低有效RECOVER事件并清除全部火警状态。
+  * @note   即使脉冲在主循环执行前已经结束，EXTI锁存标志仍可保留该事件。
+  *         持续低电平只触发一次，输入恢复高电平后才允许下一次恢复；
+  *         算法状态和历史窗口清零必须留在主循环，禁止在中断中执行。
   */
 static void recover_input_task(void)
 {
     if (recover_irq_pending == 0U) {
-        /* Returning high rearms the next falling edge after the current event. */
+        /* 输入恢复高电平后，重新允许下一次下降沿恢复事件。 */
         if (HAL_GPIO_ReadPin(UV_RECOVER_GPIO_Port, UV_RECOVER_Pin) != GPIO_PIN_RESET) {
             recover_low_latched = 0U;
         }
@@ -116,7 +115,7 @@ static void recover_input_task(void)
     {
         uint32_t now = HAL_GetTick();
 
-        /* Manual recovery clears sensor states and the final alarm output together. */
+        /* 手动恢复同时清除两个探测器状态和最终锁存报警输出。 */
         AP_IR_Reset();
         AP_UV_Process_Reset();
         BSP_ALARM_Reset();
@@ -197,13 +196,11 @@ int APP_SetTestMode(uint8_t en)
         AP_UART_SetDiagnosticMode(false);
     }
     /*
-     * 测试/应用算法使用不同的数据推进方式。切换时清空两套检测上下文和
-     * 硬件报警，防止测试历史、旧FIRE状态或脉冲队列跨模式继续生效。
+     * 测试/应用算法使用不同的数据推进方式，切换时清空检测上下文；
+     * 已锁存的整机火警只能由RECOVER/复位清除，模式命令不得隐式消警。
      */
     AP_IR_Reset();
     AP_UV_Process_Reset();
-    BSP_ALARM_Reset();
-    alarm_output_active = 0U;
     test_print_pending = 0U;
     return 0;
 }
@@ -230,6 +227,98 @@ int APP_SetIrProfileEnabled(uint8_t en)
 uint8_t APP_GetIrProfileEnabled(void)
 {
     return AP_IR_GetProfileEnabled();
+}
+
+/**
+  * @brief 更新集中故障状态，并把ADC模块故障映射到整机故障位图。
+  * @note  最终火警锁存期间仍监视电源轨、冻结和DMA，但暂停静态偏置判断，
+  *        防止火焰信号改变直流均值后产生无意义的偏置故障。
+  */
+static void app_fault_task(void)
+{
+    uint32_t adc_fault_bits = 0U;
+    uint8_t adc_flags;
+    uint8_t rail_mask;
+
+    AP_Fault_Task(HAL_GetTick());
+    (void)AP_ADC_FaultMonitorTask(HAL_GetTick(), alarm_output_active);
+    rail_mask = AP_ADC_GetRailFaultMask();
+    adc_flags = AP_ADC_GetFaultFlags();
+
+    if ((rail_mask & (1U << 0)) != 0U) adc_fault_bits |= AP_FAULT_ADC_CH38_RANGE_ERROR;
+    if ((rail_mask & (1U << 1)) != 0U) adc_fault_bits |= AP_FAULT_ADC_CH45_RANGE_ERROR;
+    if ((rail_mask & (1U << 2)) != 0U) adc_fault_bits |= AP_FAULT_ADC_CH50_RANGE_ERROR;
+    if ((adc_flags & AP_ADC_FAULT_DATA_STUCK) != 0U) adc_fault_bits |= AP_FAULT_ADC_DATA_STUCK;
+    if ((adc_flags & AP_ADC_FAULT_BIAS) != 0U) adc_fault_bits |= AP_FAULT_ADC_BIAS_ERROR;
+    if ((adc_flags & AP_ADC_FAULT_DMA) != 0U) adc_fault_bits |= AP_FAULT_ADC_DMA_ERROR;
+
+    AP_Fault_Update(AP_FAULT_ADC_CH38_RANGE_ERROR |
+                    AP_FAULT_ADC_CH45_RANGE_ERROR |
+                    AP_FAULT_ADC_CH50_RANGE_ERROR |
+                    AP_FAULT_ADC_DATA_STUCK |
+                    AP_FAULT_ADC_BIAS_ERROR |
+                    AP_FAULT_ADC_DMA_ERROR,
+                    adc_fault_bits);
+}
+
+uint8_t APP_GetAlarmActive(void)
+{
+    return alarm_output_active;
+}
+
+/**
+  * @brief 应用已经校验的SYSTEM EEPROM副本，不重复写入EEPROM。
+  * @note  重新配置会清空探测器历史，但不得清除已锁存的最终火警；
+  *        最终火警只允许通过RECOVER输入或MCU复位清除。
+  */
+void APP_ApplySystemConfig(void)
+{
+    const AP_EEPROM_System_Param_t *system = AP_EEPROM_System_Get();
+
+    show_mode_enabled = (uint8_t)system->show_mode;
+    test_mode_enabled = (uint8_t)system->test_mode;
+    AP_IR_SetProfileEnabled((uint8_t)system->ir_profile_enabled);
+    AP_IR_Reset();
+    AP_UV_Process_Reset();
+}
+
+/**
+  * @brief  恢复全部可配置EEPROM参数组，并应用校验通过的RAM副本。
+  * @retval 全部成功返回0；存在整机火警或任一参数组失败时返回-1。
+  * @note   仅操作当前四个配置扇区，不触碰设备身份及后续生产/标定扇区。
+  */
+int APP_FactoryReset(void)
+{
+    const AP_EEPROM_UV_Param_t *uv;
+    const AP_EEPROM_IR_Param_t *ir;
+    uint16_t failed_groups;
+
+    if (alarm_output_active != 0U) {
+        return -1;
+    }
+
+    failed_groups = AP_EEPROM_ResetAll();
+    uv = AP_EEPROM_UV_Get();
+    ir = AP_EEPROM_IR_Get();
+
+    /* 每组都应用其校验后的RAM副本；写失败的组继续使用原有效配置。 */
+    APP_ApplySystemConfig();
+    AP_UV_SetConfig(uv->thr_min, uv->thr_max, uv->win_min, uv->win_max,
+                    uv->cfm_min, uv->cfm_max);
+    AP_UV_SetLevel((uint8_t)uv->sensitivity);
+    AP_UV_SetPrintWindow(uv->print_window_ms);
+    BSP_TIM_IC_SetPulseRange((uint16_t)uv->pw_min_us,
+                             (uint16_t)uv->pw_max_us);
+    AP_IR_SetConfig(ir->power_min, ir->power_max,
+                    ir->r38_threshold, ir->r50_threshold,
+                    ir->freq_low_x10, ir->freq_high_x10,
+                    ir->cfm_min, ir->cfm_max);
+    AP_IR_SetLevel((uint8_t)ir->sensitivity);
+
+    /* 配置整体替换后，清空两套探测器历史，禁止旧窗口继续参与判断。 */
+    AP_IR_Reset();
+    AP_UV_Process_Reset();
+    return (failed_groups == 0U) ? 0 : -1;
 }
 
 /* USER CODE END 0 */
@@ -276,10 +365,13 @@ int main(void)
     Error_Handler();
   }
 
-  AP_EEPROM_Init();    // 加载 EEPROM 参数到内存
+  AP_Fault_Init(HAL_GetTick()); /* 统一故障位先接管BUG，并保存最近复位原因。 */
+  (void)AP_EEPROM_Init(); /* 逐组错误已由EEPROM模块写入集中故障位。 */
   AP_IR_Init();        // 从 EEPROM 加载参数并初始化红外检测
   AP_UV_Init(NULL);    // 从 EEPROM 读取参数并初始化紫外检测
-  AP_ADC_Init();
+  if (AP_ADC_Init() != BSP_ADC_OK) {
+    AP_Fault_Set(AP_FAULT_ADC_INIT_ERROR);
+  }
   AP_UART_ProtocolInit();
 
   /* EEPROM已完成CRC/范围校验，运行模式和包络开关均恢复断电前配置。 */
@@ -288,7 +380,6 @@ int main(void)
   ir_print_enabled = 0U;
   uv_print_enabled = 0U;
   alarm_output_active = 0U;
-  adc_fault_output_active = 0U;
   recover_irq_pending = 0U;
   recover_low_latched = 0U;
   show_mode_enabled = (uint8_t)system_config->show_mode;
@@ -304,7 +395,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    recover_input_task(); /* RECOVER low clears IR, UV and the final ALM state. */
+    recover_input_task(); /* RECOVER低脉冲清除IR、UV及最终ALM锁存状态。 */
 
     /*
      * USART2配置协议只在主循环执行：先消费已到达的DMA数据，再检查会话超时，
@@ -314,21 +405,6 @@ int main(void)
     AP_UART_TxTask();
     AP_UART_CheckTimeout();
 
-    /*
-     * BUG只表示红外ADC硬件级轨到轨故障，不承载初始化、通信或算法未通过状态。
-     * 监控在所有运行模式下执行，但不直接改变IR/UV火警状态。
-     */
-    {
-      uint8_t adc_fault = AP_ADC_FaultMonitorTask(HAL_GetTick());
-      if (adc_fault != adc_fault_output_active) {
-        if (adc_fault != 0U) {
-          BSP_FAULT_Set();       /* BUG低电平：任一ADC通道连续0/4095满10秒 */
-        } else {
-          BSP_FAULT_Reset();     /* BUG高电平：三通道连续恢复有效值满2秒 */
-        }
-        adc_fault_output_active = adc_fault;
-      }
-    }
     cmd_parser_task(); // 命令行解析
 
     if (APP_GetTestMode()) {
@@ -366,7 +442,8 @@ int main(void)
         uint8_t now_fire = (AP_UV_GetState() == UV_STATE_FIRE)
                         && (show_mode || (AP_IR_GetState() == IR_STATE_FIRE));
         if (now_fire && !alarm_output_active) {
-            BSP_ALARM_Set();              // Single ALM output: low means alarm
+            BSP_ALARM_Set();              // 单路ALM输出：低电平表示火警
+            alarm_output_active = 1U;
 #if defined(AP_ALGO_DEBUG_ENABLE)
             /* 仅记录最终组合报警沿，便于区分单传感器FIRE与实际输出报警。 */
             BSP_UART_Printf("[ALARM] T%lu ON MODE=%s UV=%u IR=%u\r\n",
@@ -375,20 +452,13 @@ int main(void)
                             (unsigned int)AP_UV_GetState(),
                             (unsigned int)AP_IR_GetState());
 #endif
-        } else if (!now_fire && alarm_output_active) {
-            BSP_ALARM_Reset();            // Return single ALM output high (idle)
-#if defined(AP_ALGO_DEBUG_ENABLE)
-            BSP_UART_Printf("[ALARM] T%lu OFF MODE=%s UV=%u IR=%u\r\n",
-                            (unsigned long)HAL_GetTick(),
-                            show_mode ? "SHOW" : "NORMAL",
-                            (unsigned int)AP_UV_GetState(),
-                            (unsigned int)AP_IR_GetState());
-#endif
         }
-        alarm_output_active = now_fire;
+        /* IR/UV后续掉出不自动消警，最终ALM保持到RECOVER低脉冲或MCU复位。 */
       }
     }
 
+    /* 集中故障任务放在探测任务之后，使本轮刚锁存的火警立即暂停偏置检测。 */
+    app_fault_task();
     BSP_IWDG_CheckAndRefresh();   // 检查标志位并喂狗
     /* USER CODE END WHILE */
 
@@ -454,9 +524,21 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     BSP_TIM_IC_CaptureHandler(htim);
 }
 
+/** @brief 记录一次完整三通道ADC DMA扫描，作为采集健康监视依据。 */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc_handle)
+{
+  BSP_ADC_ConvCpltHandler(hadc_handle);
+}
+
+/** @brief 记录ADC/HAL错误事件，故障确认仍由主循环完成。 */
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc_handle)
+{
+  BSP_ADC_ErrorHandler(hadc_handle);
+}
+
 /**
-  * @brief  Latch the active-low RECOVER falling edge for the main loop.
-  * @note   Do not reset detector histories or print from EXTI context.
+  * @brief  锁存低有效RECOVER下降沿，交由主循环处理。
+  * @note   EXTI中禁止清空探测历史或执行串口打印。
   */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -505,7 +587,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* Fatal MCU/software errors are not mapped to BUG; BUG is reserved for ADC rail faults. */
+  /* 致命卡死由IWDG复位恢复；可监视的当前故障统一由AP_Fault聚合。 */
   __disable_irq();
   while (1)
   {

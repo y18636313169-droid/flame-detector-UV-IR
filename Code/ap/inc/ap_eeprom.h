@@ -31,6 +31,16 @@ extern "C" {
 #define EEPROM_SECTOR_IR    (EEPROM_BASE + 2 * EEPROM_SECTOR_SIZE)   /* 0x08080080 */
 #define EEPROM_SECTOR_SYSTEM (EEPROM_BASE + 3 * EEPROM_SECTOR_SIZE)  /* 0x080800C0 */
 
+#define AP_EEPROM_OK                 (0)
+#define AP_EEPROM_ERROR_STORAGE      (-1)
+#define AP_EEPROM_ERROR_INVALID      (-2)
+
+/* 与协议config_fault_groups位布局一致。 */
+#define AP_EEPROM_GROUP_SYSTEM       (1U << 0)
+#define AP_EEPROM_GROUP_ADC          (1U << 1)
+#define AP_EEPROM_GROUP_UV           (1U << 2)
+#define AP_EEPROM_GROUP_IR           (1U << 3)
+
 /* ========================================================================== */
 /*                         1. ADC 参数                                         */
 /* ========================================================================== */
@@ -186,6 +196,9 @@ int  AP_EEPROM_IR_Reset(void);
 const AP_EEPROM_System_Param_t *AP_EEPROM_System_Get(void);
 int  AP_EEPROM_System_Save(const AP_EEPROM_System_Param_t *p);
 int  AP_EEPROM_System_Reset(void);
+
+/** @brief 恢复四个可配置扇区的默认值，返回写入失败的参数组位图。 */
+uint16_t AP_EEPROM_ResetAll(void);
 
 #ifdef __cplusplus
 }

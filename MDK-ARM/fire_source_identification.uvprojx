@@ -622,6 +622,11 @@
               <FilePath>..\Code\ap\src\ap_eeprom.c</FilePath>
             </File>
             <File>
+              <FileName>ap_fault.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Code\ap\src\ap_fault.c</FilePath>
+            </File>
+            <File>
               <FileName>ap_ir.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Code\ap\src\ap_ir.c</FilePath>

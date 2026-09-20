@@ -12,6 +12,7 @@
 #include "ap_uart_protocol.h"
 
 #include "ap_eeprom.h"
+#include "ap_fault.h"
 #include "ap_ir.h"
 #include "ap_uv.h"
 #include "crc16.h"
@@ -25,6 +26,12 @@
 #define AP_UART_F0_DATA_LEN                (6U)
 #define AP_UART_CONFIG_SNAPSHOT_LEN        (84U)
 #define AP_UART_CONFIG_RESPONSE_LEN        (AP_UART_CONFIG_SNAPSHOT_LEN)
+#define AP_UART_STATUS_SNAPSHOT_LEN        (24U)
+#define AP_UART_ALARM_DETAIL_LEN           (12U)
+#define AP_UART_FAULT_DETAIL_LEN           (16U)
+#define AP_UART_DEVICE_INFO_LEN            (20U)
+#define AP_UART_FACTORY_RESET_MAGIC         (0x46525354UL) /* ASCII "FRST" */
+#define AP_UART_STORAGE_FAILURE_LIMIT       (3U)
 
 /*
  * 128字节是包含帧头、长度、CRC在内的单帧线长上限；固定开销9字节后，
@@ -40,6 +47,14 @@ typedef char AP_UART_ConfigLayoutMustRemain84Bytes[
     ((4U + AP_UART_CONFIG_FIELD_COUNT * 4U) == AP_UART_CONFIG_SNAPSHOT_LEN) ? 1 : -1];
 typedef char AP_UART_ConfigMustFitData[
     (AP_UART_CONFIG_RESPONSE_LEN <= AP_UART_DATA_MAX) ? 1 : -1];
+typedef char AP_UART_StatusMustFitData[
+    (AP_UART_STATUS_SNAPSHOT_LEN <= AP_UART_DATA_MAX) ? 1 : -1];
+typedef char AP_UART_AlarmDetailMustFitData[
+    (AP_UART_ALARM_DETAIL_LEN <= AP_UART_DATA_MAX) ? 1 : -1];
+typedef char AP_UART_FaultDetailMustFitData[
+    (AP_UART_FAULT_DETAIL_LEN <= AP_UART_DATA_MAX) ? 1 : -1];
+typedef char AP_UART_DeviceInfoMustFitData[
+    (AP_UART_DEVICE_INFO_LEN <= AP_UART_DATA_MAX) ? 1 : -1];
 
 typedef enum {
     RX_PARSE_SOF0 = 0,
@@ -47,7 +62,13 @@ typedef enum {
     RX_PARSE_FRAME,
 } RxParseState_t;
 
-/** @brief 最多两帧的响应事务；GET_CONFIG使用配置帧加F0，其余请求只使用F0。 */
+typedef enum {
+    CONFIG_SET_SUCCESS = 0,
+    CONFIG_SET_INVALID,
+    CONFIG_SET_STORAGE_ERROR,
+} ConfigSetResult_t;
+
+/** @brief 最多两帧的响应事务；数据查询使用业务数据帧加F0。 */
 typedef struct {
     uint8_t  active;
     uint8_t  frame_count;
@@ -61,7 +82,7 @@ typedef struct {
 /**
  * @brief 最近一次已执行请求及其完整响应缓存。
  * @note  树莓派严格停等，因此缓存一条即可覆盖应答丢失后的同帧重发。
- *        GET_CONFIG包含0x81配置数据帧+F0两帧，必须整体缓存和整体重放。
+ *        双帧查询必须整体缓存和整体重放，不能重新采集第二份状态快照。
  */
 typedef struct {
     uint8_t  valid;
@@ -90,10 +111,14 @@ static uint16_t s_rx_expected;
 static uint32_t s_rx_start_ms;
 
 static TxBundle_t    s_tx;
-static RequestCache_t s_cache;
+static RequestCache_t s_cache;       /* 10秒配置会话的请求缓存 */
+static RequestCache_t s_query_cache; /* 无需建联的只读查询独立缓存 */
 static SessionState_t s_session;
 static uint16_t       s_tx_sequence;
 static uint8_t        s_diagnostic_mode;
+static uint8_t        s_storage_fail_system;
+static uint8_t        s_storage_fail_uv;
+static uint8_t        s_storage_fail_ir;
 
 static void put_u16_le(uint8_t *dst, uint16_t value)
 {
@@ -217,50 +242,52 @@ static void append_f0(uint16_t request_sequence, uint8_t request_message_id,
 }
 
 /** @brief 缓存请求及全部响应，保证重复SET不再擦写EEPROM。 */
-static void cache_current_response(uint16_t sequence, uint8_t message_id,
-                                   const uint8_t *data, uint8_t data_len)
+static void cache_current_response(RequestCache_t *cache, uint16_t sequence,
+                                   uint8_t message_id, const uint8_t *data,
+                                   uint8_t data_len)
 {
-    memset(&s_cache, 0, sizeof(s_cache));
-    s_cache.valid = 1U;
-    s_cache.request_sequence = sequence;
-    s_cache.request_message_id = message_id;
-    s_cache.request_data_len = data_len;
+    memset(cache, 0, sizeof(*cache));
+    cache->valid = 1U;
+    cache->request_sequence = sequence;
+    cache->request_message_id = message_id;
+    cache->request_data_len = data_len;
     if (data_len > 0U) {
-        memcpy(s_cache.request_data, data, data_len);
+        memcpy(cache->request_data, data, data_len);
     }
-    s_cache.response_count = s_tx.frame_count;
+    cache->response_count = s_tx.frame_count;
     for (uint8_t i = 0U; i < s_tx.frame_count; i++) {
-        s_cache.response_length[i] = s_tx.length[i];
-        memcpy(s_cache.response_frame[i], s_tx.frame[i], s_tx.length[i]);
+        cache->response_length[i] = s_tx.length[i];
+        memcpy(cache->response_frame[i], s_tx.frame[i], s_tx.length[i]);
     }
 }
 
 /** @brief 比较请求序号、ID、长度和Data，判断是否为最近请求的原样重发。 */
-static uint8_t cached_request_matches(uint16_t sequence, uint8_t message_id,
+static uint8_t cached_request_matches(const RequestCache_t *cache,
+                                      uint16_t sequence, uint8_t message_id,
                                       const uint8_t *data, uint8_t data_len)
 {
-    if (s_cache.valid == 0U || s_cache.request_sequence != sequence ||
-        s_cache.request_message_id != message_id ||
-        s_cache.request_data_len != data_len) {
+    if (cache->valid == 0U || cache->request_sequence != sequence ||
+        cache->request_message_id != message_id ||
+        cache->request_data_len != data_len) {
         return 0U;
     }
     if (data_len == 0U) {
         return 1U;
     }
-    return (memcmp(s_cache.request_data, data, data_len) == 0) ? 1U : 0U;
+    return (memcmp(cache->request_data, data, data_len) == 0) ? 1U : 0U;
 }
 
 /** @brief 原样重放缓存响应；保留旧响应帧序号，不重新执行请求。 */
-static void replay_cached_response(void)
+static void replay_cached_response(const RequestCache_t *cache)
 {
     memset(&s_tx, 0, sizeof(s_tx));
     s_tx.active = 1U;
     /* 重放也属于一次新发送，不能沿用清零后的时间戳触发500ms立即超时。 */
     s_tx.last_progress_ms = HAL_GetTick();
-    s_tx.frame_count = s_cache.response_count;
-    for (uint8_t i = 0U; i < s_cache.response_count; i++) {
-        s_tx.length[i] = s_cache.response_length[i];
-        memcpy(s_tx.frame[i], s_cache.response_frame[i], s_cache.response_length[i]);
+    s_tx.frame_count = cache->response_count;
+    for (uint8_t i = 0U; i < cache->response_count; i++) {
+        s_tx.length[i] = cache->response_length[i];
+        memcpy(s_tx.frame[i], cache->response_frame[i], cache->response_length[i]);
     }
 }
 
@@ -307,6 +334,7 @@ static void abort_transport(void)
     memset(&s_tx, 0, sizeof(s_tx));
     parser_reset();
     session_reset();
+    memset(&s_query_cache, 0, sizeof(s_query_cache));
 }
 
 /** @brief 将已经持久化的IR配置同步到检测器当前运行参数。 */
@@ -321,27 +349,41 @@ static void apply_ir_config(const AP_EEPROM_IR_Param_t *p)
 
 /**
  * @brief 修改一个SYSTEM配置。
- * @note  复用现有APP接口完成“先落盘、后生效”；相同值由APP接口直接成功返回，
- *        不会产生重复EEPROM写入。协议不新增任何报警清除行为。
+ * @note  候选组必须先完成落盘和读回校验，再统一应用到运行状态；
+ *        正常组的相同值不重复写，待重配组的相同值仍强制验证一次存储。
  */
-static uint8_t set_system_value(uint8_t message_id, uint32_t value)
+static ConfigSetResult_t set_system_value(uint8_t message_id, uint32_t value)
 {
+    AP_EEPROM_System_Param_t candidate = *AP_EEPROM_System_Get();
+    uint32_t *field = NULL;
+    int save_result;
+
     if (message_id == AP_MSG_SET_SHOW_MODE) {
-        if (value > 1U) return 0U;
-        return (APP_SetShowMode((uint8_t)value) == 0) ? 1U : 0U;
+        field = &candidate.show_mode;
+    } else if (message_id == AP_MSG_SET_IR_PROFILE_ENABLED) {
+        field = &candidate.ir_profile_enabled;
+    } else {
+        return CONFIG_SET_INVALID;
     }
-    if (message_id == AP_MSG_SET_IR_PROFILE_ENABLED) {
-        if (value > 1U) return 0U;
-        return (APP_SetIrProfileEnabled((uint8_t)value) == 0) ? 1U : 0U;
+    if (value > 1U) return CONFIG_SET_INVALID;
+
+    if (*field == value &&
+        (AP_Fault_GetConfigGroups() & AP_EEPROM_GROUP_SYSTEM) == 0U) {
+        return CONFIG_SET_SUCCESS;
     }
-    return 0U;
+    *field = value;
+    save_result = AP_EEPROM_System_Save(&candidate);
+    if (save_result == AP_EEPROM_ERROR_INVALID) return CONFIG_SET_INVALID;
+    if (save_result != AP_EEPROM_OK) return CONFIG_SET_STORAGE_ERROR;
+    APP_ApplySystemConfig();
+    return CONFIG_SET_SUCCESS;
 }
 
 /**
  * @brief 事务式修改一个UV字段：候选组校验、落盘读回后再更新运行参数。
- * @return 1表示已生效或原值相同，0表示ID、参数或存储失败。
+ * @return 区分成功、参数非法和存储失败，只有存储失败计入三次恢复策略。
  */
-static uint8_t set_uv_value(uint8_t message_id, uint32_t value)
+static ConfigSetResult_t set_uv_value(uint8_t message_id, uint32_t value)
 {
     AP_EEPROM_UV_Param_t candidate = *AP_EEPROM_UV_Get();
     uint32_t *field = NULL;
@@ -356,31 +398,38 @@ static uint8_t set_uv_value(uint8_t message_id, uint32_t value)
         case AP_MSG_SET_UV_CFM_MAX_MS:  field = &candidate.cfm_max; break;
         case AP_MSG_SET_UV_PW_MIN_US:   field = &candidate.pw_min_us; break;
         case AP_MSG_SET_UV_PW_MAX_US:   field = &candidate.pw_max_us; break;
-        default: return 0U;
+        default: return CONFIG_SET_INVALID;
     }
 
     /* 幂等SET不写EEPROM，避免树莓派同步或重发相同配置消耗写入寿命。 */
-    if (*field == value) {
-        return 1U;
+    if (*field == value &&
+        (AP_Fault_GetConfigGroups() & AP_EEPROM_GROUP_UV) == 0U) {
+        return CONFIG_SET_SUCCESS;
     }
     *field = value;
-    if (AP_EEPROM_UV_Save(&candidate) != 0) {
-        return 0U;
+    {
+        int save_result = AP_EEPROM_UV_Save(&candidate);
+        if (save_result == AP_EEPROM_ERROR_INVALID) {
+            return CONFIG_SET_INVALID;
+        }
+        if (save_result != AP_EEPROM_OK) {
+            return CONFIG_SET_STORAGE_ERROR;
+        }
     }
     apply_uv_config(AP_EEPROM_UV_Get());
     if (message_id == AP_MSG_SET_UV_PW_MIN_US ||
         message_id == AP_MSG_SET_UV_PW_MAX_US) {
-        /* Apply the new range without retaining pulses accepted by the old range. */
+        /* 脉宽范围变化后清空旧脉冲，禁止旧范围已接收数据参与新配置判断。 */
         AP_UV_ClearPulseHistory();
     }
-    return 1U;
+    return CONFIG_SET_SUCCESS;
 }
 
 /**
  * @brief 事务式修改一个IR字段：候选组校验、落盘读回后再更新运行参数。
- * @return 1表示已生效或原值相同，0表示ID、参数或存储失败。
+ * @return 区分成功、参数非法和存储失败，只有存储失败计入三次恢复策略。
  */
-static uint8_t set_ir_value(uint8_t message_id, uint32_t value)
+static ConfigSetResult_t set_ir_value(uint8_t message_id, uint32_t value)
 {
     AP_EEPROM_IR_Param_t candidate = *AP_EEPROM_IR_Get();
     uint32_t *field = NULL;
@@ -395,28 +444,36 @@ static uint8_t set_ir_value(uint8_t message_id, uint32_t value)
         case AP_MSG_SET_IR_FREQ_HIGH_X10:field = &candidate.freq_high_x10; break;
         case AP_MSG_SET_IR_CFM_MIN_MS:   field = &candidate.cfm_min; break;
         case AP_MSG_SET_IR_CFM_MAX_MS:   field = &candidate.cfm_max; break;
-        default: return 0U;
+        default: return CONFIG_SET_INVALID;
     }
 
-    if (*field == value) {
-        return 1U;
+    if (*field == value &&
+        (AP_Fault_GetConfigGroups() & AP_EEPROM_GROUP_IR) == 0U) {
+        return CONFIG_SET_SUCCESS;
     }
     *field = value;
-    if (AP_EEPROM_IR_Save(&candidate) != 0) {
-        return 0U;
+    {
+        int save_result = AP_EEPROM_IR_Save(&candidate);
+        if (save_result == AP_EEPROM_ERROR_INVALID) {
+            return CONFIG_SET_INVALID;
+        }
+        if (save_result != AP_EEPROM_OK) {
+            return CONFIG_SET_STORAGE_ERROR;
+        }
     }
     apply_ir_config(AP_EEPROM_IR_Get());
-    return 1U;
+    return CONFIG_SET_SUCCESS;
 }
 
 /** @brief 校验SET的4字节Data，并按MessageID分发到SYSTEM、UV或IR参数组。 */
-static uint8_t set_config_value(uint8_t message_id, const uint8_t *data,
-                                uint8_t data_len)
+static ConfigSetResult_t set_config_value(uint8_t message_id,
+                                          const uint8_t *data,
+                                          uint8_t data_len)
 {
     uint32_t value;
 
     if (data_len != 4U) {
-        return 0U;
+        return CONFIG_SET_INVALID;
     }
     value = get_u32_le(data);
 
@@ -432,7 +489,80 @@ static uint8_t set_config_value(uint8_t message_id, const uint8_t *data,
         message_id <= AP_MSG_SET_IR_CFM_MAX_MS) {
         return set_ir_value(message_id, value);
     }
+    return CONFIG_SET_INVALID;
+}
+
+/** @brief 将SET消息ID映射到持久化参数组及其连续写失败计数器。 */
+static uint16_t set_message_group(uint8_t message_id, uint8_t **counter)
+{
+    if (message_id >= AP_MSG_SET_SHOW_MODE &&
+        message_id <= AP_MSG_SET_IR_PROFILE_ENABLED) {
+        *counter = &s_storage_fail_system;
+        return AP_EEPROM_GROUP_SYSTEM;
+    }
+    if (message_id >= AP_MSG_SET_UV_SENSITIVITY &&
+        message_id <= AP_MSG_SET_UV_PW_MAX_US) {
+        *counter = &s_storage_fail_uv;
+        return AP_EEPROM_GROUP_UV;
+    }
+    if (message_id >= AP_MSG_SET_IR_SENSITIVITY &&
+        message_id <= AP_MSG_SET_IR_CFM_MAX_MS) {
+        *counter = &s_storage_fail_ir;
+        return AP_EEPROM_GROUP_IR;
+    }
+    *counter = NULL;
     return 0U;
+}
+
+/**
+ * @brief 仅统计真实EEPROM存储失败，同一参数组连续三次失败后恢复默认值。
+ * @note  非法参数不消耗存储重试次数。即使默认值写入成功，也继续保留
+ *        NEED_CONFIG，直到树莓派重新写入并验证目标产品配置。
+ */
+static void track_set_result(uint8_t message_id, ConfigSetResult_t result)
+{
+    uint8_t *counter;
+    uint16_t group = set_message_group(message_id, &counter);
+    int reset_result = AP_EEPROM_ERROR_STORAGE;
+
+    if (counter == NULL || group == 0U) {
+        return;
+    }
+    if (result == CONFIG_SET_SUCCESS) {
+        *counter = 0U;
+        return;
+    }
+    if (result != CONFIG_SET_STORAGE_ERROR) {
+        return;
+    }
+
+    if (*counter < AP_UART_STORAGE_FAILURE_LIMIT) {
+        (*counter)++;
+    }
+    if (*counter < AP_UART_STORAGE_FAILURE_LIMIT) {
+        return;
+    }
+
+    AP_Fault_SetDefaultsRecoveryActive(1U);
+    if (group == AP_EEPROM_GROUP_SYSTEM) {
+        reset_result = AP_EEPROM_System_Reset();
+        APP_ApplySystemConfig();
+    } else if (group == AP_EEPROM_GROUP_UV) {
+        reset_result = AP_EEPROM_UV_Reset();
+        apply_uv_config(AP_EEPROM_UV_Get());
+        AP_UV_ClearPulseHistory();
+    } else if (group == AP_EEPROM_GROUP_IR) {
+        reset_result = AP_EEPROM_IR_Reset();
+        apply_ir_config(AP_EEPROM_IR_Get());
+        AP_IR_Reset();
+    }
+    AP_Fault_SetDefaultsRecoveryActive(0U);
+
+    /* 默认值恢复成功可能清除组故障，这里重新保留原始故障和待配置请求。 */
+    (void)reset_result;
+    AP_Fault_Set(AP_FAULT_EEPROM_WRITE_ERROR);
+    AP_Fault_SetConfigGroups(group);
+    *counter = 0U;
 }
 
 /** @brief 按协议固定偏移编码20项配置，禁止直接发送编译器结构体布局。 */
@@ -473,13 +603,170 @@ static void build_config_snapshot(uint8_t *snapshot)
     (void)offset; /* 长度由编译期常量和上方固定字段表共同约束。 */
 }
 
+/** @brief 按协议固定偏移编码24字节整机状态快照。 */
+static void build_status_snapshot(uint8_t *snapshot)
+{
+    uint32_t fault_bits = AP_Fault_GetBits();
+    uint8_t alarm = APP_GetAlarmActive();
+    uint8_t system_state = (uint8_t)((alarm != 0U ? 1U : 0U) |
+                                     (fault_bits != 0U ? 2U : 0U));
+
+    memset(snapshot, 0, AP_UART_STATUS_SNAPSHOT_LEN);
+    put_u16_le(&snapshot[0], AP_UART_STATUS_SCHEMA_VERSION);
+    put_u16_le(&snapshot[2], AP_UART_STATUS_SNAPSHOT_LEN);
+    snapshot[4] = system_state;
+    snapshot[5] = (uint8_t)AP_IR_GetState();
+    snapshot[6] = (uint8_t)AP_UV_GetState();
+    snapshot[7] = APP_GetShowMode();
+    put_u32_le(&snapshot[8], fault_bits);
+    snapshot[12] = (uint8_t)AP_Fault_GetResetReason();
+    snapshot[13] = AP_Fault_GetConfigStatus();
+    put_u16_le(&snapshot[14], AP_Fault_GetConfigGroups());
+    put_u32_le(&snapshot[16], HAL_GetTick() / 1000U);
+    put_u32_le(&snapshot[20], AP_FW_VERSION_U32);
+}
+
+/** @brief 编码整机火警、ALARM引脚命令电平及两个探测器内部状态。 */
+static void build_alarm_detail(uint8_t *detail)
+{
+    memset(detail, 0, AP_UART_ALARM_DETAIL_LEN);
+    put_u16_le(&detail[0], AP_UART_STATUS_SCHEMA_VERSION);
+    put_u16_le(&detail[2], AP_UART_ALARM_DETAIL_LEN);
+    detail[4] = APP_GetAlarmActive();
+    detail[5] = (uint8_t)AP_IR_GetState();
+    detail[6] = (uint8_t)AP_UV_GetState();
+    detail[7] = APP_GetShowMode();
+    detail[8] = APP_GetAlarmActive() ? 0U : 1U; /* ALARM命令电平：0为报警。 */
+    detail[9] = (HAL_GPIO_ReadPin(UV_RECOVER_GPIO_Port,
+                                  UV_RECOVER_Pin) == GPIO_PIN_RESET) ? 0U : 1U;
+}
+
+/** @brief 编码当前全部故障位及参数恢复相关状态。 */
+static void build_fault_detail(uint8_t *detail)
+{
+    uint32_t fault_bits = AP_Fault_GetBits();
+
+    memset(detail, 0, AP_UART_FAULT_DETAIL_LEN);
+    put_u16_le(&detail[0], AP_UART_STATUS_SCHEMA_VERSION);
+    put_u16_le(&detail[2], AP_UART_FAULT_DETAIL_LEN);
+    put_u32_le(&detail[4], fault_bits);
+    detail[8] = AP_Fault_GetConfigStatus();
+    detail[9] = (uint8_t)AP_Fault_GetResetReason();
+    put_u16_le(&detail[10], AP_Fault_GetConfigGroups());
+    detail[12] = (fault_bits != 0U) ? 0U : 1U; /* BUG命令电平：0为故障。 */
+    detail[13] = AP_Fault_GetMissedPeriods();
+}
+
+/** @brief 编码只读固件版本、灵敏度及认证信息。 */
+static void build_device_info(uint8_t *info)
+{
+    const AP_EEPROM_UV_Param_t *uv = AP_EEPROM_UV_Get();
+    const AP_EEPROM_IR_Param_t *ir = AP_EEPROM_IR_Get();
+
+    memset(info, 0, AP_UART_DEVICE_INFO_LEN);
+    put_u16_le(&info[0], AP_UART_DEVICE_INFO_SCHEMA_VERSION);
+    put_u16_le(&info[2], AP_UART_DEVICE_INFO_LEN);
+    put_u32_le(&info[4], AP_FW_VERSION_U32);
+    put_u16_le(&info[8], AP_UART_CONFIG_SCHEMA_VERSION);
+    put_u16_le(&info[10], AP_UART_STATUS_SCHEMA_VERSION);
+    info[12] = (uint8_t)ir->sensitivity;
+    info[13] = (uint8_t)uv->sensitivity;
+    info[14] = 0xFFU; /* 正式试验冻结参数前，1S等级和Lm均保持无效。 */
+    info[15] = 0U;
+    put_u32_le(&info[16], 0U);
+}
+
+/** @brief 判断消息是否属于无需配置会话的只读查询。 */
+static uint8_t is_read_query(uint8_t message_id)
+{
+    return (message_id == AP_MSG_GET_STATUS ||
+            message_id == AP_MSG_GET_ALARM_DETAIL ||
+            message_id == AP_MSG_GET_FAULT_DETAIL ||
+            message_id == AP_MSG_GET_DEVICE_INFO) ? 1U : 0U;
+}
+
+/** @brief 判断合法查询是否可以刷新30秒通信链路监视。 */
+static uint8_t is_operational_query(uint8_t message_id)
+{
+    return (message_id == AP_MSG_GET_STATUS ||
+            message_id == AP_MSG_GET_ALARM_DETAIL ||
+            message_id == AP_MSG_GET_FAULT_DETAIL) ? 1U : 0U;
+}
+
+/** @brief 完成无会话只读查询，不改变配置会话的序号状态。 */
+static void finish_query(uint16_t sequence, uint8_t message_id,
+                         const uint8_t *data, uint8_t data_len,
+                         AP_UART_Result_t result)
+{
+    append_f0(sequence, message_id, result);
+    cache_current_response(&s_query_cache, sequence, message_id, data, data_len);
+}
+
+/** @brief 生成一帧只读业务数据，并追加统一F0结果帧。 */
+static void handle_read_query(uint16_t sequence, uint8_t message_id,
+                              const uint8_t *data, uint8_t data_len,
+                              uint32_t now_ms)
+{
+    uint8_t response[AP_UART_STATUS_SNAPSHOT_LEN];
+    uint8_t response_id = 0U;
+    uint16_t response_len = 0U;
+
+    tx_bundle_begin();
+    if (data_len != 0U) {
+        finish_query(sequence, message_id, data, data_len,
+                     AP_UART_RESULT_FAILED);
+        return;
+    }
+
+    /* 链路恢复必须先清故障，再生成本次返回快照。 */
+    if (is_operational_query(message_id) != 0U) {
+        AP_Fault_NotifyOperationalQuery(now_ms);
+    }
+
+    switch (message_id) {
+        case AP_MSG_GET_STATUS:
+            build_status_snapshot(response);
+            response_id = AP_MSG_STATUS_DATA;
+            response_len = AP_UART_STATUS_SNAPSHOT_LEN;
+            break;
+        case AP_MSG_GET_ALARM_DETAIL:
+            build_alarm_detail(response);
+            response_id = AP_MSG_ALARM_DETAIL;
+            response_len = AP_UART_ALARM_DETAIL_LEN;
+            break;
+        case AP_MSG_GET_FAULT_DETAIL:
+            build_fault_detail(response);
+            response_id = AP_MSG_FAULT_DETAIL;
+            response_len = AP_UART_FAULT_DETAIL_LEN;
+            break;
+        case AP_MSG_GET_DEVICE_INFO:
+            build_device_info(response);
+            response_id = AP_MSG_DEVICE_INFO;
+            response_len = AP_UART_DEVICE_INFO_LEN;
+            break;
+        default:
+            finish_query(sequence, message_id, data, data_len,
+                         AP_UART_RESULT_FAILED);
+            return;
+    }
+
+    if (tx_bundle_add(response_id, response, response_len) == 0U) {
+        tx_bundle_begin();
+        finish_query(sequence, message_id, data, data_len,
+                     AP_UART_RESULT_FAILED);
+        return;
+    }
+    finish_query(sequence, message_id, data, data_len,
+                 AP_UART_RESULT_SUCCESS);
+}
+
 /** @brief 完成新请求：追加F0、保存去重响应，并推进会话序号基准。 */
 static void finish_request(uint16_t sequence, uint8_t message_id,
                            const uint8_t *data, uint8_t data_len,
                            AP_UART_Result_t result)
 {
     append_f0(sequence, message_id, result);
-    cache_current_response(sequence, message_id, data, data_len);
+    cache_current_response(&s_cache, sequence, message_id, data, data_len);
     s_session.latest_sequence = sequence;
     s_session.latest_sequence_valid = 1U;
 }
@@ -497,9 +784,10 @@ static void handle_handshake(uint16_t sequence, const uint8_t *data,
     }
 
     if (s_session.active != 0U && s_session.nonce == nonce &&
-        cached_request_matches(sequence, AP_MSG_HANDSHAKE, data, data_len)) {
+        cached_request_matches(&s_cache, sequence, AP_MSG_HANDSHAKE,
+                               data, data_len)) {
         s_session.last_rx_ms = now_ms;
-        replay_cached_response();
+        replay_cached_response(&s_cache);
         return;
     }
 
@@ -538,6 +826,19 @@ static void handle_get_config(uint16_t sequence, const uint8_t *data,
                    AP_UART_RESULT_SUCCESS);
 }
 
+/** @brief 仅在有效配置会话内校验并执行受保护的恢复出厂命令。 */
+static void handle_factory_reset(uint16_t sequence, const uint8_t *data,
+                                 uint8_t data_len)
+{
+    AP_UART_Result_t result = AP_UART_RESULT_FAILED;
+
+    if (data_len == 4U && get_u32_le(data) == AP_UART_FACTORY_RESET_MAGIC &&
+        APP_GetAlarmActive() == 0U && APP_FactoryReset() == 0) {
+        result = AP_UART_RESULT_SUCCESS;
+    }
+    finish_request(sequence, AP_MSG_FACTORY_RESET, data, data_len, result);
+}
+
 /**
  * @brief 处理已通过基础帧校验的请求，执行建联、去重、新旧序号和业务分发。
  * @note  F0为单向响应，收到后静默丢弃且不刷新会话。
@@ -547,7 +848,7 @@ static void process_request(uint16_t sequence, uint8_t message_id,
                             uint32_t now_ms)
 {
     uint16_t delta;
-    uint8_t success;
+    ConfigSetResult_t set_result;
 
     /*
      * F0是从机发送方向的统一应答。若因线路回环或对端误发被本板收到，
@@ -581,6 +882,29 @@ static void process_request(uint16_t sequence, uint8_t message_id,
         return;
     }
 
+    /*
+     * 运行状态查询不依赖10秒配置会话，并使用独立去重缓存，防止30秒周期
+     * 查询覆盖最后一条SET响应或推进配置会话的请求序号。
+     */
+    if (is_read_query(message_id) != 0U) {
+        if (s_query_cache.valid != 0U &&
+            s_query_cache.request_sequence == sequence) {
+            if (cached_request_matches(&s_query_cache, sequence, message_id,
+                                       data, data_len)) {
+                if (is_operational_query(message_id) != 0U && data_len == 0U) {
+                    AP_Fault_NotifyOperationalQuery(now_ms);
+                }
+                replay_cached_response(&s_query_cache);
+            } else {
+                tx_bundle_begin();
+                append_f0(sequence, message_id, AP_UART_RESULT_FAILED);
+            }
+            return;
+        }
+        handle_read_query(sequence, message_id, data, data_len, now_ms);
+        return;
+    }
+
     tx_bundle_begin();
     if (s_session.active == 0U) {
         append_f0(sequence, message_id, AP_UART_RESULT_FAILED);
@@ -591,8 +915,9 @@ static void process_request(uint16_t sequence, uint8_t message_id,
     if (s_session.latest_sequence_valid != 0U) {
         delta = (uint16_t)(sequence - s_session.latest_sequence);
         if (delta == 0U) {
-            if (cached_request_matches(sequence, message_id, data, data_len)) {
-                replay_cached_response();
+            if (cached_request_matches(&s_cache, sequence, message_id,
+                                       data, data_len)) {
+                replay_cached_response(&s_cache);
             } else {
                 /* 同序号内容冲突只失败应答，不覆盖最后一次成功缓存。 */
                 tx_bundle_begin();
@@ -611,10 +936,16 @@ static void process_request(uint16_t sequence, uint8_t message_id,
         handle_get_config(sequence, data, data_len);
         return;
     }
+    if (message_id == AP_MSG_FACTORY_RESET) {
+        handle_factory_reset(sequence, data, data_len);
+        return;
+    }
 
-    success = set_config_value(message_id, data, data_len);
+    set_result = set_config_value(message_id, data, data_len);
+    track_set_result(message_id, set_result);
     finish_request(sequence, message_id, data, data_len,
-                   success ? AP_UART_RESULT_SUCCESS : AP_UART_RESULT_FAILED);
+                   (set_result == CONFIG_SET_SUCCESS) ?
+                   AP_UART_RESULT_SUCCESS : AP_UART_RESULT_FAILED);
 }
 
 /** @brief 校验完整候选帧的CRC和Sequence，通过后交给请求处理器。 */
@@ -707,8 +1038,12 @@ void AP_UART_ProtocolInit(void)
     parser_reset();
     memset(&s_tx, 0, sizeof(s_tx));
     session_reset();
+    memset(&s_query_cache, 0, sizeof(s_query_cache));
     s_tx_sequence = 0U;
     s_diagnostic_mode = 0U;
+    s_storage_fail_system = 0U;
+    s_storage_fail_uv = 0U;
+    s_storage_fail_ir = 0U;
 }
 
 /** @brief 有界消费USART2 DMA数据；严格停等期间不解析下一请求。 */
